@@ -1,0 +1,363 @@
+// Copyright Citra Emulator Project / Azahar Emulator Project
+// Licensed under GPLv2 or any later version
+// Refer to the license.txt file included.
+
+#include <algorithm>
+#include <chrono>
+#include <iterator>
+#include <mutex>
+#include <numeric>
+#include <sstream>
+#include <thread>
+#include <fmt/chrono.h>
+#include <fmt/format.h>
+#include "common/file_util.h"
+#include "common/settings.h"
+#include "core/core_timing.h"
+#include "core/perf_stats.h"
+#include "video_core/gpu.h"
+
+using namespace std::chrono_literals;
+using DoubleSecs = std::chrono::duration<double, std::chrono::seconds::period>;
+using std::chrono::duration_cast;
+using std::chrono::microseconds;
+using std::chrono::nanoseconds;
+
+constexpr double FRAME_LENGTH = 1.0 / SCREEN_REFRESH_RATE;
+// Purposefully ignore the first five frames, as there's a significant amount of overhead in
+// booting that we shouldn't account for
+constexpr std::size_t IgnoreFrames = 5;
+
+namespace Core {
+
+namespace {
+std::atomic_bool performance_profiling_enabled{false};
+constexpr std::size_t RendererEventCount = static_cast<std::size_t>(RendererProfileEvent::Count);
+std::array<std::atomic<u64>, RendererEventCount> renderer_event_counts{};
+std::array<std::atomic<u64>, RendererEventCount> renderer_event_nanoseconds{};
+std::array<std::atomic<u64>, RendererEventCount> renderer_event_bytes{};
+
+std::size_t RendererEventIndex(RendererProfileEvent event) {
+    return static_cast<std::size_t>(event);
+}
+} // namespace
+
+void SetPerformanceProfilingEnabled(bool enabled) {
+    performance_profiling_enabled.store(enabled, std::memory_order_release);
+}
+
+bool IsPerformanceProfilingEnabled() {
+    return performance_profiling_enabled.load(std::memory_order_acquire);
+}
+
+ScopedRendererProfileEvent::ScopedRendererProfileEvent(RendererProfileEvent event_, u64 bytes)
+    : event{event_}, enabled{IsPerformanceProfilingEnabled()} {
+    if (!enabled) {
+        return;
+    }
+    const std::size_t index = RendererEventIndex(event);
+    renderer_event_counts[index].fetch_add(1, std::memory_order_relaxed);
+    renderer_event_bytes[index].fetch_add(bytes, std::memory_order_relaxed);
+    start = Clock::now();
+}
+
+ScopedRendererProfileEvent::~ScopedRendererProfileEvent() {
+    if (!enabled) {
+        return;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start);
+    renderer_event_nanoseconds[RendererEventIndex(event)].fetch_add(
+        static_cast<u64>(elapsed.count()), std::memory_order_relaxed);
+}
+
+bool PerfStats::game_frames_updated = true;
+
+PerfStats::PerfStats(u64 title_id) : title_id(title_id) {}
+
+PerfStats::~PerfStats() {
+    if (!Settings::values.record_frame_times || title_id == 0) {
+        return;
+    }
+
+    const std::time_t t = std::time(nullptr);
+    std::ostringstream stream;
+    std::copy(perf_history.begin() + IgnoreFrames, perf_history.begin() + current_index,
+              std::ostream_iterator<double>(stream, "\n"));
+    const std::string& path = FileUtil::GetUserPath(FileUtil::UserPath::LogDir);
+    // %F Date format expanded is "%Y-%m-%d"
+    const std::string filename =
+        fmt::format("{}/{:%F-%H-%M}_{:016X}.csv", path, *std::localtime(&t), title_id);
+    FileUtil::IOFile file(filename, "w");
+    file.WriteString(stream.str());
+}
+
+void PerfStats::BeginSVCProcessing() {
+    if (!IsPerformanceProfilingEnabled()) {
+        return;
+    }
+    start_svc_time = Clock::now();
+}
+
+void PerfStats::EndSVCProcessing() {
+    if (!IsPerformanceProfilingEnabled()) {
+        return;
+    }
+    accumulated_svc_time += (Clock::now() - start_svc_time);
+}
+
+void PerfStats::BeginIPCProcessing() {
+    if (!IsPerformanceProfilingEnabled()) {
+        return;
+    }
+    start_ipc_time = Clock::now();
+}
+
+void PerfStats::EndIPCProcessing() {
+    if (!IsPerformanceProfilingEnabled()) {
+        return;
+    }
+    accumulated_ipc_time += (Clock::now() - start_ipc_time);
+}
+
+void PerfStats::BeginGPUProcessing() {
+    if (!IsPerformanceProfilingEnabled()) {
+        return;
+    }
+    start_gpu_time = Clock::now();
+}
+
+void PerfStats::EndGPUProcessing() {
+    if (!IsPerformanceProfilingEnabled()) {
+        return;
+    }
+    accumulated_gpu_time += (Clock::now() - start_gpu_time);
+}
+
+void PerfStats::StartSwap() {
+    if (!IsPerformanceProfilingEnabled()) {
+        return;
+    }
+    start_swap_time = Clock::now();
+}
+
+void PerfStats::EndSwap() {
+    if (!IsPerformanceProfilingEnabled()) {
+        return;
+    }
+    accumulated_swap_time += (Clock::now() - start_swap_time);
+}
+
+void PerfStats::BeginSystemFrame() {
+    std::scoped_lock lock{object_mutex};
+
+    frame_begin = Clock::now();
+}
+
+void PerfStats::EndSystemFrame() {
+    std::scoped_lock lock{object_mutex};
+
+    auto frame_end = Clock::now();
+    const auto frame_time = frame_end - frame_begin;
+    if (current_index < perf_history.size()) {
+        perf_history[current_index++] =
+            std::chrono::duration<double, std::milli>(frame_time).count();
+    }
+    accumulated_frametime += frame_time;
+    system_frames += 1;
+
+    // TODO: Track previous frame times in a less stupid way. -OS
+    previous_previous_frame_length = previous_frame_length;
+
+    previous_frame_length = frame_end - previous_frame_end;
+    previous_frame_end = frame_end;
+}
+
+void PerfStats::EndGameFrame() {
+    std::scoped_lock lock{object_mutex};
+
+    game_frames += 1;
+    PerfStats::game_frames_updated = true;
+}
+
+double PerfStats::GetMeanFrametime() const {
+    std::scoped_lock lock{object_mutex};
+
+    if (current_index <= IgnoreFrames) {
+        return 0;
+    }
+
+    const double sum = std::accumulate(perf_history.begin() + IgnoreFrames,
+                                       perf_history.begin() + current_index, 0.0);
+    return sum / static_cast<double>(current_index - IgnoreFrames);
+}
+
+PerfStats::Results PerfStats::GetAndResetStats(microseconds current_system_time_us) {
+    std::scoped_lock lock{object_mutex};
+
+    const auto now = Clock::now();
+    // Walltime elapsed since stats were reset
+    const auto interval = duration_cast<DoubleSecs>(now - reset_point).count();
+
+    const auto system_us_per_second = (current_system_time_us - reset_point_system_us) / interval;
+
+    last_stats.system_fps = static_cast<double>(system_frames) / interval;
+    last_stats.game_fps = static_cast<double>(game_frames) / interval;
+    last_stats.time_vblank_interval =
+        system_frames ? (duration_cast<DoubleSecs>(accumulated_frametime).count() /
+                         static_cast<double>(system_frames))
+                      : 0;
+    last_stats.time_hle_svc =
+        system_frames
+            ? (duration_cast<DoubleSecs>(accumulated_svc_time - accumulated_ipc_time).count() /
+               static_cast<double>(system_frames))
+            : 0;
+    last_stats.time_hle_ipc =
+        system_frames
+            ? (duration_cast<DoubleSecs>(accumulated_ipc_time - accumulated_gpu_time).count() /
+               static_cast<double>(system_frames))
+            : 0;
+    last_stats.time_gpu = system_frames ? (duration_cast<DoubleSecs>(accumulated_gpu_time).count() /
+                                           static_cast<double>(system_frames))
+                                        : 0;
+    last_stats.time_swap = system_frames
+                               ? (duration_cast<DoubleSecs>(accumulated_swap_time).count() /
+                                  static_cast<double>(system_frames))
+                               : 0;
+
+    last_stats.time_remaining =
+        system_frames ? (duration_cast<DoubleSecs>((accumulated_frametime - accumulated_svc_time) -
+                                                   accumulated_swap_time)
+                             .count() /
+                         static_cast<double>(system_frames))
+                      : 0;
+    last_stats.emulation_speed = system_us_per_second.count() / 1'000'000.0;
+    const auto take_renderer_event = [&](RendererProfileEvent event, u64& count, u64& time,
+                                         u64& bytes) {
+        const std::size_t index = RendererEventIndex(event);
+        count = renderer_event_counts[index].exchange(0, std::memory_order_relaxed);
+        time = renderer_event_nanoseconds[index].exchange(0, std::memory_order_relaxed);
+        bytes = renderer_event_bytes[index].exchange(0, std::memory_order_relaxed);
+    };
+    u64 ignored_bytes{};
+    take_renderer_event(RendererProfileEvent::SoftwareDraw, last_stats.software_draw_count,
+                        last_stats.software_draw_nanoseconds, ignored_bytes);
+    take_renderer_event(RendererProfileEvent::SoftwareTextureCopy,
+                        last_stats.software_texture_copy_count,
+                        last_stats.software_texture_copy_nanoseconds, ignored_bytes);
+    take_renderer_event(RendererProfileEvent::FlushRegion, last_stats.flush_count,
+                        last_stats.flush_nanoseconds, last_stats.flush_bytes);
+    take_renderer_event(RendererProfileEvent::SurfaceDownload, last_stats.download_count,
+                        last_stats.download_nanoseconds, last_stats.download_bytes);
+    last_stats.artic_transmitted = static_cast<double>(artic_transmitted) / interval;
+    last_stats.artic_events.raw = artic_events.raw | prev_artic_event.raw;
+
+    // Reset counters
+    reset_point = now;
+    reset_point_system_us = current_system_time_us;
+    accumulated_frametime = Clock::duration::zero();
+    system_frames = 0;
+    accumulated_svc_time = Clock::duration::zero();
+    accumulated_ipc_time = Clock::duration::zero();
+    accumulated_gpu_time = Clock::duration::zero();
+    accumulated_swap_time = Clock::duration::zero();
+    game_frames = 0;
+    artic_transmitted = 0;
+    prev_artic_event.raw &= artic_events.raw;
+
+    return last_stats;
+}
+
+PerfStats::Results PerfStats::GetLastStats() {
+    std::scoped_lock lock{object_mutex};
+
+    return last_stats;
+}
+
+double PerfStats::GetLastFrameTimeScale() const {
+    std::scoped_lock lock{object_mutex};
+
+    return duration_cast<DoubleSecs>(previous_frame_length).count() / FRAME_LENGTH;
+}
+
+double PerfStats::GetStableFrameTimeScale() const {
+    std::scoped_lock lock{object_mutex};
+
+    const double stable_previous_frame_length =
+        (duration_cast<DoubleSecs>(previous_frame_length).count() +
+         duration_cast<DoubleSecs>(previous_previous_frame_length).count()) /
+        2;
+    return stable_previous_frame_length / FRAME_LENGTH;
+}
+
+void FrameLimiter::WaitOnce() {
+    if (frame_advancing_enabled) {
+        // Frame advancing is enabled: wait on event instead of doing framelimiting
+        frame_advance_event.Wait();
+        frame_advance_event.Reset();
+    }
+}
+
+void FrameLimiter::DoFrameLimiting(microseconds current_system_time_us) {
+    if (frame_advancing_enabled) {
+        // Frame advancing is enabled: wait on event instead of doing framelimiting
+        frame_advance_event.Wait();
+        frame_advance_event.Reset();
+        return;
+    }
+
+    auto now = Clock::now();
+    double sleep_scale = Settings::GetFrameLimit() / 100.0;
+
+    if (Settings::GetFrameLimit() == 0) {
+        return;
+    }
+
+    // Max lag caused by slow frames. Shouldn't be more than the length of a frame at the current
+    // speed percent or it will clamp too much and prevent this from properly limiting to that
+    // percent. High values means it'll take longer after a slow frame to recover and start limiting
+    const microseconds max_lag_time_us = duration_cast<microseconds>(
+        std::chrono::duration<double, std::chrono::microseconds::period>(25ms / sleep_scale));
+    frame_limiting_delta_err += duration_cast<microseconds>(
+        std::chrono::duration<double, std::chrono::microseconds::period>(
+            (current_system_time_us - previous_system_time_us) / sleep_scale));
+    frame_limiting_delta_err -= duration_cast<microseconds>(now - previous_walltime);
+    frame_limiting_delta_err =
+        std::clamp(frame_limiting_delta_err, -max_lag_time_us, max_lag_time_us);
+
+    if (frame_limiting_delta_err > microseconds::zero()) {
+        std::this_thread::sleep_for(frame_limiting_delta_err);
+        auto now_after_sleep = Clock::now();
+        if (IsPerformanceProfilingEnabled()) {
+            accumulated_sleep_nanoseconds.fetch_add(
+                static_cast<u64>(duration_cast<nanoseconds>(now_after_sleep - now).count()),
+                std::memory_order_relaxed);
+        }
+        frame_limiting_delta_err -= duration_cast<microseconds>(now_after_sleep - now);
+        now = now_after_sleep;
+    }
+
+    previous_system_time_us = current_system_time_us;
+    previous_walltime = now;
+}
+
+u64 FrameLimiter::TakeAccumulatedSleepNanoseconds() {
+    return accumulated_sleep_nanoseconds.exchange(0, std::memory_order_relaxed);
+}
+
+bool FrameLimiter::IsFrameAdvancing() const {
+    return frame_advancing_enabled;
+}
+
+void FrameLimiter::SetFrameAdvancing(bool value) {
+    const bool was_enabled = frame_advancing_enabled.exchange(value);
+    if (was_enabled && !value) {
+        // Set the event to let emulation continue
+        frame_advance_event.Set();
+    }
+}
+
+void FrameLimiter::AdvanceFrame() {
+    frame_advance_event.Set();
+}
+
+} // namespace Core
