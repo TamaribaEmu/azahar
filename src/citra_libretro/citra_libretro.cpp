@@ -66,7 +66,7 @@
 
 class CitraLibRetro {
 public:
-    CitraLibRetro() : log_filter(Common::Log::Level::Debug) {}
+    CitraLibRetro() : log_filter(Common::Log::Level::Info) {}
 
     Common::Log::Filter log_filter;
     std::unique_ptr<EmuWindow_LibRetro> emu_window;

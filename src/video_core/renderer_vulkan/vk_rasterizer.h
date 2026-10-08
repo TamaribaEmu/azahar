@@ -74,6 +74,8 @@ private:
 
     /// Syncs all enabled PICA texture units
     void SyncTextureUnits(const Framebuffer* framebuffer);
+    /// The texture units bound the original way (a new set, written): for cube maps.
+    void SyncTextureUnitsWritten(const Framebuffer* framebuffer);
 
     /// Syncs all utility textures in the fragment shader.
     void SyncUtilityTextures(const Framebuffer* framebuffer);
@@ -116,6 +118,26 @@ private:
 private:
     const Instance& instance;
     Scheduler& scheduler;
+
+    // The descriptor sets of the previous draw and what they hold, for reuse within one
+    // submission (SyncTextureUnits, SyncUtilityTextures).
+    struct TextureBinding {
+        vk::ImageView view;
+        vk::Sampler sampler;
+        bool operator==(const TextureBinding&) const = default;
+    };
+    struct TextureSetCache {
+        std::array<TextureBinding, 3> bindings{};
+        vk::DescriptorSet set;
+        u64 tick = 0;
+        bool valid = false;
+    } texture_set_cache;
+    struct UtilitySetCache {
+        vk::ImageView view;
+        vk::DescriptorSet set;
+        u64 tick = 0;
+        bool valid = false;
+    } utility_set_cache;
     RenderManager& renderpass_cache;
     DescriptorUpdateQueue& update_queue;
     PipelineCache pipeline_cache;

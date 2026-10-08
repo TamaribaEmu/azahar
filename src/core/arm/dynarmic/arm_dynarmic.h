@@ -6,6 +6,8 @@
 
 #include <map>
 #include <memory>
+#include <set>
+#include <utility>
 #include <vector>
 #include <dynarmic/interface/A32/a32.h>
 #include "common/common_types.h"
@@ -101,6 +103,11 @@ private:
     };
     void LoadPersistentModulesIfReady();
     void FlushPersistentModule(const PersistentModule& module);
+    // Boot-time warm-up of loadable modules (CROs): their code is saved beside their block
+    // lists when they load, and at boot their blocks are compiled from that copy into the
+    // dormant set, so the first load of a module in a session reactivates instead of compiling.
+    void SavePersistentModuleCode(const PersistentModule& module);
+    void PrewarmPersistentModules();
 
     friend class DynarmicUserCallbacks;
     Core::System& system;
@@ -121,8 +128,20 @@ private:
     u32 persistent_cache_code_size = 0;
     std::shared_ptr<Memory::PageTable> persistent_cache_page_table;
     bool persistent_cache_loaded = false;
+    bool persistent_cache_flushed = false;  // written already (System::Shutdown)
     std::vector<PersistentModule> persistent_modules;
     std::vector<DormantModule> dormant_modules;
+    /// While prewarming: Dynarmic reads these bytes for [code_override_start, +size) instead of
+    /// guest memory (MemoryReadCode), so a module can be compiled before the game loads it.
+    u32 code_override_start = 0;
+    std::vector<u8> code_override;
+    /// (module hash, executable hash) pairs whose code is known to be on disk.
+    std::set<std::pair<u64, u64>> saved_module_code;
+    /// Per module hash: digest of the block list last read from or written to disk.
+    std::map<u64, u64> saved_module_digests;
+    /// Each module's descriptor list as read from its cache file (relative to the module), so a
+    /// module loaded again (Pokémon's field after every battle) skips reading and decoding it.
+    std::map<u64, std::vector<u64>> module_descriptor_cache;
 };
 
 } // namespace Core

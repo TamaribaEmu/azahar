@@ -29,6 +29,10 @@ private:
 class SVC_SyncCallback;
 class SVC_IPCCallback;
 
+/// Where the guest MobiClip decode function with this output stride continues after its entry
+/// (used when native decoding of a frame fails). Only used in builds with AZAHAR_MVD_FFMPEG.
+void SetNativeMobiclipBody(u32 stride, u32 guest_body);
+
 } // namespace Kernel
 
 BOOST_CLASS_EXPORT_KEY(Kernel::SVC_SyncCallback)

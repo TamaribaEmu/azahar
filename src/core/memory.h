@@ -284,6 +284,8 @@ public:
     /// Currently active page table
     void SetCurrentPageTable(std::shared_ptr<PageTable> page_table);
     std::shared_ptr<PageTable> GetCurrentPageTable() const;
+    /// The same without the reference-count traffic, for per-slice checks
+    PageTable* GetCurrentPageTableRaw() const;
 
     /**
      * Gets a pointer to the given address.

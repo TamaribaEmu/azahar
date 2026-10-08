@@ -237,7 +237,11 @@ vk::ShaderModule CompileSPV(std::span<const u32> code, vk::Device device) {
 
 vk::ShaderModule Compile(std::string_view code, vk::ShaderStageFlagBits stage, vk::Device device,
                          std::string_view premable) {
-    return CompileSPV(CompileGLSL(code, stage, premable), device);
+    // CompileSPV times the module creation; this times the GLSL to SPIR-V step.
+    auto spirv = [&] {
+        return CompileGLSL(code, stage, premable);
+    }();
+    return CompileSPV(spirv, device);
 }
 
 } // namespace Vulkan

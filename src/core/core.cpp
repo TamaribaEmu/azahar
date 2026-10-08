@@ -2,6 +2,9 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include <stdexcept>
 #include <utility>
 #include <boost/serialization/array.hpp>
@@ -33,6 +36,7 @@
 #include "core/hle/kernel/ipc_debugger/recorder.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/process.h"
+#include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/thread.h"
 #include "core/hle/service/apt/applet_manager.h"
 #include "core/hle/service/apt/apt.h"
@@ -229,6 +233,7 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 current_core_to_execute->Step();
             }
         }
+        Reschedule();
     } else {
         // Now all cores are at the same global time. So we will run them one after the other
         // with a max slice that is the minimum of all max slices of all cores
@@ -265,10 +270,9 @@ System::ResultStatus System::RunLoop(bool tight_loop) {
                 }
             }
             max_slice = cpu_core->GetTimer().GetTicks() - start_ticks;
+            Reschedule();
         }
     }
-
-    Reschedule();
 
     return status;
 }
@@ -453,19 +457,67 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     }
 
 #ifdef AZAHAR_MVD_FFMPEG
-    if (title_id == 0x000400000011C400ULL) {
-        constexpr u32 decoder_entry = 0x001BC6E4U;
-        constexpr u32 decoder_signature = 0xE92D5FF0U;
-        constexpr u32 native_decode_svc = 0xEF00007FU;
-        if (Memory().Read32(decoder_entry) == decoder_signature) {
-            Memory().Write32(decoder_entry, native_decode_svc);
-            LOG_INFO(Core, "Enabled native MobiClip decoding for Pokemon Omega Ruby Rev 2");
-        } else {
-            LOG_WARNING(Core,
-                        "Pokemon Omega Ruby MobiClip signature mismatch; using guest decoder");
+    {
+        // Find the MobiClip video library's three frame decoders (see NativeMobiclipDecode in
+        // svc.cpp) and replace each entry instruction with its native-decode SVC. The functions
+        // are identical apart from the output stride, which the instruction at +0x114 adds.
+        constexpr std::array<u32, 16> signature{
+            0xE92D5FF0, 0xE5901000, 0xE3A02000, 0xE0D130B2, 0xE1A03803, 0xE0933003,
+            0x2A000046, 0xE2522001, 0xBB000257, 0xE5904048, 0xEB00025A, 0xE3540000,
+            0x028FE00C, 0x0A000C94, 0xE3560000, 0x10844006};
+        struct Variant {
+            u32 stride_instruction;
+            u32 stride;
+            u32 svc;
+        };
+        constexpr std::array<Variant, 3> variants{{{0xE28BBA01, 256, 0xEF00007E},
+                                                   {0xE28BBA02, 512, 0xEF00007F},
+                                                   {0xE28BB901, 1024, 0xEF000081}}};
+        // B/BL offsets depend on where the library was linked; compare the opcode only.
+        const auto opcode = [](u32 word) {
+            const u32 op = (word >> 24) & 0x0F;
+            return op == 0x0A || op == 0x0B ? word & 0xFF000000 : word;
+        };
+        const auto& code = process->codeset->memory;
+        const auto& segment = process->codeset->CodeSegment();
+        constexpr std::size_t function_size = 0x118;
+        if (segment.offset <= code.size() && segment.size <= code.size() - segment.offset &&
+            segment.size >= function_size) {
+            const u8* base = code.data() + segment.offset;
+            const auto word_at = [base](std::size_t offset) {
+                u32 word;
+                std::memcpy(&word, base + offset, sizeof(word));
+                return word;
+            };
+            for (std::size_t offset = 0; offset + function_size <= segment.size; offset += 4) {
+                if (word_at(offset) != signature[0])
+                    continue;
+                std::size_t i = 1;
+                while (i < signature.size() &&
+                       opcode(word_at(offset + i * 4)) == opcode(signature[i]))
+                    ++i;
+                if (i != signature.size())
+                    continue;
+                const u32 stride_instruction = word_at(offset + 0x114);
+                const u32 entry = segment.addr + static_cast<u32>(offset);
+                const auto variant =
+                    std::find_if(variants.begin(), variants.end(), [&](const Variant& v) {
+                        return v.stride_instruction == stride_instruction;
+                    });
+                if (variant == variants.end()) {
+                    LOG_WARNING(Core, "MobiClip decoder at {:#010x} has an unknown stride ({:#010x})",
+                                entry, stride_instruction);
+                    continue;
+                }
+                Kernel::SetNativeMobiclipBody(variant->stride, entry + 4);
+                Memory().Write32(entry, variant->svc);
+                LOG_INFO(Core, "Native MobiClip decoding for the stride {} decoder at {:#010x}",
+                         variant->stride, entry);
+            }
         }
     }
 #endif
+
 
 #if CITRA_ARCH(x86_64) || CITRA_ARCH(arm64)
     if (Settings::values.use_cpu_jit && title_id != 0) {
@@ -516,7 +568,7 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
 
 void System::PrepareReschedule() {
     running_core->PrepareReschedule();
-    reschedule_pending = true;
+    curr_core_reschedule_pending = true;
 }
 
 void System::RegisterJitModule(u64 module_hash, u64 executable_hash, u32 code_start,
@@ -596,15 +648,12 @@ double System::GetStableFrameTimeScale() {
 }
 
 void System::Reschedule() {
-    if (!reschedule_pending) {
+    if (!curr_core_reschedule_pending) {
         return;
     }
 
-    reschedule_pending = false;
-    for (const auto& core : cpu_cores) {
-        LOG_TRACE(Core_ARM11, "Reschedule core {}", core->GetID());
-        kernel->GetThreadManager(core->GetID()).Reschedule();
-    }
+    curr_core_reschedule_pending = false;
+    kernel->GetThreadManager(running_core->GetID()).Reschedule();
 }
 
 System::ResultStatus System::Init(Frontend::EmuWindow& emu_window,

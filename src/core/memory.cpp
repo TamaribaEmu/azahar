@@ -417,6 +417,10 @@ std::shared_ptr<PageTable> MemorySystem::GetCurrentPageTable() const {
     return impl->current_page_table;
 }
 
+PageTable* MemorySystem::GetCurrentPageTableRaw() const {
+    return impl->current_page_table.get();
+}
+
 void MemorySystem::RasterizerFlushVirtualRegion(VAddr start, u32 size, FlushMode mode) {
     impl->RasterizerFlushVirtualRegion(start, size, mode);
 }

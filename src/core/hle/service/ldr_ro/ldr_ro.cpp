@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <array>
+#include <map>
+#include <vector>
 #include "common/alignment.h"
 #include "common/archives.h"
 #include "common/common_types.h"
@@ -15,6 +17,7 @@
 #include "core/hle/service/ldr_ro/cro_helper.h"
 #include "core/hle/service/ldr_ro/ldr_ro.h"
 #include "core/memory.h"
+#include <xxhash.h>
 
 SERVICE_CONSTRUCT_IMPL(Service::LDR::RO)
 SERIALIZE_EXPORT_IMPL(Service::LDR::RO)
@@ -63,18 +66,20 @@ static bool VerifyBufferState(Kernel::Process& process, VAddr buffer_ptr, u32 si
 }
 
 static u64 HashCRO(Core::System& system, const Kernel::Process& process, VAddr address, u32 size) {
+    // XXH3 rather than a byte-at-a-time FNV loop: this runs twice per CRO load over about a
+    // megabyte each, on the emulation thread.
     constexpr std::size_t chunk_size = 64 * 1024;
     std::array<u8, chunk_size> buffer{};
-    u64 hash = 1469598103934665603ULL;
+    XXH3_state_t* state = XXH3_createState();
+    XXH3_64bits_reset(state);
     for (u32 offset = 0; offset < size;) {
         const std::size_t length = std::min<std::size_t>(chunk_size, size - offset);
         system.Memory().ReadBlock(process, address + offset, buffer.data(), length);
-        for (std::size_t i = 0; i < length; ++i) {
-            hash ^= buffer[i];
-            hash *= 1099511628211ULL;
-        }
+        XXH3_64bits_update(state, buffer.data(), length);
         offset += static_cast<u32>(length);
     }
+    const u64 hash = XXH3_64bits_digest(state);
+    XXH3_freeState(state);
     return hash;
 }
 
@@ -185,6 +190,56 @@ void RO::UnloadCRR(Kernel::HLERequestContext& ctx) {
     LOG_WARNING(Service_LDR, "(STUBBED) called, crr_buffer_ptr=0x{:08X}", crr_buffer_ptr);
 }
 
+// Game Freak's movie player (Pokémon X/Y through Ultra Sun/Moon; Ultra Moon's "MovieLib",
+// Omega Ruby's "DllTitle") runs its demux thread as
+//     loop: gate.Wait(); if (quit) return; Tick(); nop; nop; b loop
+// with the gate signalled for the whole movie, so the thread never blocks and takes all spare
+// CPU time. That is free on a 3DS but costs the emulator real time for every idle cycle. The
+// first nop becomes SVC 0x82, which sleeps the thread for 1 ms (the tick only tops up the
+// decoder queues; a movie frame lasts 33 ms).
+constexpr u32 MovieIdleSleepSvc = 0xEF000082;
+constexpr std::array<u32, 12> MovieLoopPattern{
+    0xE92D4010, 0xE1A04000, 0xE2840000, 0xEB000000, 0xE5D40000, 0xE3500001,
+    0x0A000004, 0xE1A00004, 0xEB000000, 0xE320F000, 0xE320F000, 0xEAFFFFF5};
+/// Bits that must match: bl targets and the gate/quit field offsets (0x24/0x14 in Ultra Moon,
+/// 0x20/0x10 in Omega Ruby) vary.
+constexpr std::array<u32, 12> MovieLoopMask{
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFF000, 0xFF000000, 0xFFFFF000, 0xFFFFFFFF,
+    0xFFFFFFFF, 0xFFFFFFFF, 0xFF000000, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+constexpr std::size_t MovieLoopIdleSlot = 9;
+
+/// Finds the movie loop in [begin, begin + size); `slot` is what the idle slot holds.
+static std::vector<VAddr> FindMovieLoops(Memory::MemorySystem& memory, VAddr begin, u32 size,
+                                         u32 slot) {
+    std::vector<VAddr> found;
+    // One block copy, then a plain scan: a word-by-word Read32 over a 1 MiB module took ms.
+    std::vector<u32> words(size / 4);
+    memory.ReadBlock(begin, words.data(), words.size() * 4);
+    const std::size_t count = MovieLoopPattern.size();
+    for (std::size_t at = 0; at + count <= words.size(); ++at) {
+        if (words[at] != MovieLoopPattern[0])
+            continue;
+        bool match = true;
+        for (std::size_t i = 1; i < count && match; ++i) {
+            const u32 word = words[at + i];
+            if (i == MovieLoopIdleSlot)
+                match = word == slot;
+            else
+                match = (word & MovieLoopMask[i]) == MovieLoopPattern[i];
+        }
+        if (match)
+            found.push_back(begin + static_cast<u32>((at + MovieLoopIdleSlot) * 4));
+    }
+    return found;
+}
+
+// The scan above reads the whole module (~2 ms on the Shield for a 1 MiB one) and its answer
+// never changes for the same module, which Pokémon loads again after every battle: the idle
+// slots by module content (offsets from the executable pages), and the slots patched in each
+// loaded module so that unloading needs no scan either. Every write checks the word first.
+static std::map<u64, std::vector<u32>> movie_slots_by_module;
+static std::map<VAddr, std::vector<VAddr>> patched_movie_slots;
+
 void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
     IPC::RequestParser rp(ctx);
     VAddr cro_buffer_ptr = rp.Pop<u32>();
@@ -283,6 +338,7 @@ void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
     }
 
     CROHelper cro(cro_address, *process, system);
+    cro.CoverOwnInvalidation(cro_size);  // InvalidateCacheRange(cro_address, cro_size) below
 
     result = cro.VerifyHash(cro_size, crr_address);
     if (result.IsError()) {
@@ -334,6 +390,31 @@ void RO::LoadCRO(Kernel::HLERequestContext& ctx, bool link_on_load_bug_fix) {
 
     auto [exe_begin, exe_size] = cro.GetExecutablePages();
     if (exe_begin) {
+        auto known = movie_slots_by_module.find(cro_hash);
+        if (known == movie_slots_by_module.end()) {
+            std::vector<u32> offsets;
+            for (const VAddr idle_slot : FindMovieLoops(system.Memory(), exe_begin, exe_size,
+                                                        MovieLoopPattern[MovieLoopIdleSlot])) {
+                offsets.push_back(idle_slot - exe_begin);
+            }
+            known = movie_slots_by_module.emplace(cro_hash, std::move(offsets)).first;
+        }
+        std::vector<VAddr> patched;
+        for (const u32 offset : known->second) {
+            const VAddr idle_slot = exe_begin + offset;
+            if (offset >= exe_size ||
+                system.Memory().Read32(idle_slot) != MovieLoopPattern[MovieLoopIdleSlot]) {
+                continue;
+            }
+            system.Memory().Write32(idle_slot, MovieIdleSleepSvc);
+            patched.push_back(idle_slot);
+            LOG_INFO(Service_LDR, "CRO \"{}\": movie thread sleeps when idle (0x{:08X})",
+                     cro.ModuleName(), idle_slot);
+        }
+        if (patched.empty())
+            patched_movie_slots.erase(exe_begin);
+        else
+            patched_movie_slots[exe_begin] = std::move(patched);
         result = process->vm_manager.ReprotectRange(exe_begin, exe_size,
                                                     Kernel::VMAPermission::ReadExecute);
         if (result.IsError()) {
@@ -394,12 +475,22 @@ void RO::UnloadCRO(Kernel::HLERequestContext& ctx) {
     LOG_INFO(Service_LDR, "Unloading CRO \"{}\"", cro.ModuleName());
 
     u32 fixed_size = cro.GetFixedSize();
+    cro.CoverOwnInvalidation(fixed_size);  // InvalidateCacheRange(cro_address, fixed_size) below
     const VAddr exe_begin = std::get<0>(cro.GetExecutablePages());
     const u32 exe_size = std::get<1>(cro.GetExecutablePages());
     if (exe_begin) {
         // Relocation cleanup invalidates compiled blocks, so capture them first.
         const u64 executable_hash = HashCRO(system, *process, exe_begin, exe_size);
         system.CheckpointJitModule(exe_begin, executable_hash);
+        // Leave the game's buffer as it was loaded, so a reload hashes and patches the same.
+        if (const auto patched = patched_movie_slots.find(exe_begin);
+            patched != patched_movie_slots.end()) {
+            for (const VAddr idle_slot : patched->second) {
+                if (system.Memory().Read32(idle_slot) == MovieIdleSleepSvc)
+                    system.Memory().Write32(idle_slot, MovieLoopPattern[MovieLoopIdleSlot]);
+            }
+            patched_movie_slots.erase(patched);
+        }
     }
 
     cro.Unregister(slot->loaded_crs);

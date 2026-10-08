@@ -236,6 +236,10 @@ std::optional<std::pair<u64, Shader* const>> ShaderDiskCache::UseFixedGeometrySh
 }
 
 GraphicsPipeline* ShaderDiskCache::GetPipeline(const PipelineInfo& info) {
+    if (memo_pipeline &&
+        std::memcmp(&info.state, &memo_state.state, sizeof(info.state)) == 0) {
+        return memo_pipeline;
+    }
 
     u64 hash = info.Hash();
     u64 optimized_hash = info.state.OptimizedHash(parent.instance);
@@ -266,7 +270,10 @@ GraphicsPipeline* ShaderDiskCache::GetPipeline(const PipelineInfo& info) {
         AppendPLConfig(pl_cache, entry, hash);
     }
 
-    return it.value().get();
+    GraphicsPipeline* const pipeline = it.value().get();
+    memo_state.state = info.state;
+    memo_pipeline = pipeline;
+    return pipeline;
 }
 
 ShaderDiskCache::SourceFileCacheVersionHash ShaderDiskCache::GetSourceFileCacheVersionHash() {
@@ -1327,7 +1334,10 @@ bool ShaderDiskCache::InitGSCache(const std::atomic_bool& stop_loading,
 bool ShaderDiskCache::InitPLCache(const std::atomic_bool& stop_loading,
                                   const VideoCore::DiskResourceLoadCallback& callback) {
 
-    auto cleanup_on_error = [&]() { graphics_pipelines.clear(); };
+    auto cleanup_on_error = [&]() {
+        graphics_pipelines.clear();
+        memo_pipeline = nullptr;
+    };
 
     LOG_INFO(Render_Vulkan, "Loading PL disk shader cache for title {:016X}", title_id);
 

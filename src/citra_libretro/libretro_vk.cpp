@@ -162,11 +162,16 @@ bool CreateVulkanDevice(struct retro_vulkan_context* context, VkInstance instanc
     }
 
     // Create device
-    const float queue_priority = 1.0f;
+    // Two queues when the family has them: the frontend presents on the second, so a present
+    // that blocks for a refresh never holds up our submits on the first (they used to share
+    // one queue and its lock, and a slow present starved the emulation thread).
+    const float queue_priorities[2] = {1.0f, 1.0f};
+    const uint32_t queue_count =
+        std::min<uint32_t>(2, queue_families[graphics_queue_family].queueCount);
     VkDeviceQueueCreateInfo queue_info{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     queue_info.queueFamilyIndex = graphics_queue_family;
-    queue_info.queueCount = 1;
-    queue_info.pQueuePriorities = &queue_priority;
+    queue_info.queueCount = queue_count;
+    queue_info.pQueuePriorities = queue_priorities;
 
     VkPhysicalDeviceFeatures2 enabled_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     enabled_features.features = merged_features;
@@ -205,13 +210,17 @@ bool CreateVulkanDevice(struct retro_vulkan_context* context, VkInstance instanc
 
     VkQueue queue = VK_NULL_HANDLE;
     vkGetDeviceQueue(device, graphics_queue_family, 0, &queue);
+    VkQueue presentation_queue = queue;
+    if (queue_count > 1) {
+        vkGetDeviceQueue(device, graphics_queue_family, 1, &presentation_queue);
+    }
 
     // Fill in the context for the frontend
     context->gpu = gpu;
     context->device = device;
     context->queue = queue;
     context->queue_family_index = graphics_queue_family;
-    context->presentation_queue = queue; // Same queue for LibRetro
+    context->presentation_queue = presentation_queue;
     context->presentation_queue_family_index = graphics_queue_family;
 
     LOG_INFO(Render_Vulkan,

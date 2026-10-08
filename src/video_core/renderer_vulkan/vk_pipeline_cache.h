@@ -53,6 +53,11 @@ public:
         return descriptor_set;
     }
 
+    /// Binds a set acquired earlier again (a draw that needs the same descriptors).
+    void Rebind(DescriptorHeapType type, vk::DescriptorSet descriptor_set) {
+        bound_descriptor_sets[static_cast<u32>(type)] = descriptor_set;
+    }
+
     /// Sets the dynamic offset for the uniform buffer at binding
     void UpdateRange(u8 binding, u32 offset) {
         offsets[binding] = offset;
@@ -154,6 +159,9 @@ private:
     std::array<DescriptorHeap, NumDescriptorHeaps> descriptor_heaps;
     std::array<vk::DescriptorSet, NumRasterizerSets> bound_descriptor_sets{};
     std::array<u32, NumDynamicOffsets> offsets{};
+    // What the previous BindPipeline bound (it skips binding them again unchanged).
+    std::array<vk::DescriptorSet, NumRasterizerSets> last_bound_sets{};
+    std::array<u32, NumDynamicOffsets> last_offsets{};
 
     std::array<u64, MAX_SHADER_STAGES> shader_hashes;
     std::array<Shader*, MAX_SHADER_STAGES> current_shaders;

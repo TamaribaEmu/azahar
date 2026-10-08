@@ -125,8 +125,12 @@ public:
         return renderpass_cache;
     }
 
-    /// Returns the removal threshold ticks for the garbage collector
-    u32 RemoveThreshold();
+    /// Gets an opaque tick-value used to indicate to the garbage collector when a surface was made.
+    u64 GetResourceTick();
+
+    /// Gets an opaque tick-value used to indicate to the garbage collector what surfaces can be
+    /// safely deleted.
+    u64 GetResourceFreeTick();
 
     /// Submits and waits for current GPU work.
     void Finish();
@@ -351,6 +355,14 @@ public:
 
     u32 Scale() const noexcept {
         return res_scale;
+    }
+
+    /// The size the Vulkan framebuffer was created with.
+    u32 Width() const noexcept {
+        return width;
+    }
+    u32 Height() const noexcept {
+        return height;
     }
 
 private:

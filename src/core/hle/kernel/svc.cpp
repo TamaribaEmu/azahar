@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <memory>
+#include <unordered_map>
+#include <vector>
 #include <fmt/format.h>
 #ifdef AZAHAR_MVD_FFMPEG
 extern "C" {
@@ -488,6 +491,7 @@ private:
     Result SetTimer(Handle handle, s64 initial, s64 interval);
     Result CancelTimer(Handle handle);
     void SleepThread(s64 nanoseconds);
+    void MovieThreadIdle();
     s64 GetSystemTick();
     Result GetHandleInfo(s64* out, Handle handle, u32 type);
     Result CreateMemoryBlock(Handle* out_handle, u32 addr, u32 size, u32 my_permission,
@@ -510,7 +514,10 @@ private:
     Result UnmapProcessMemoryEx(Handle process, u32 dst_address, u32 size);
     Result ControlProcess(Handle process_handle, u32 process_OP, u32 varg2, u32 varg3);
 #ifdef AZAHAR_MVD_FFMPEG
-    void OmegaRubyMobiclipDecode();
+    void NativeMobiclipDecode(std::size_t variant);
+    void NativeMobiclipDecode256();
+    void NativeMobiclipDecode512();
+    void NativeMobiclipDecode1024();
 #endif
 
     struct FunctionDef {
@@ -528,86 +535,175 @@ private:
 
 #ifdef AZAHAR_MVD_FFMPEG
 namespace {
-constexpr u32 OmegaRubyMobiclipGuestBody = 0x001BC6E8;
-constexpr std::size_t OmegaRubyMobiclipInputSize = 24 * 1024;
+// The MobiClip video library in Pokémon X/Y, Omega Ruby/Alpha Sapphire, Sun/Moon and Ultra
+// Sun/Moon decodes one frame per call in software on the 3DS CPU, which the JIT runs about
+// three times slower than real time. Core::System::Load finds the library's three decode
+// functions (one per output row stride) and patches each entry with one of these SVCs; the
+// frame is then decoded natively with FFmpeg into the same layout the guest code writes:
+//   state+0x00 the frame's packet, state+0x04 width, state+0x08 height,
+//   state+0x0C luma rows (stride apart), state+0x24 chroma rows (stride apart), each row
+//   U then V at half a stride.
+std::array<u32, 3> mobiclip_guest_body{};  // 256, 512, 1024: the decode function body (entry + 4)
+constexpr std::array<u32, 3> MobiclipStrides{256, 512, 1024};
+constexpr std::size_t MobiclipMaxInputSize = 512 * 1024;
 
-class OmegaRubyMobiclipDecoder {
+/// One FFmpeg decoder for one guest decoder state. P-frames predict from the previous five
+/// frames, which FFmpeg keeps itself, so each stream needs its own context (Ultra Sun/Moon plays
+/// two streams at once), and every frame since the last keyframe must have been decoded here.
+class MobiclipStream {
 public:
-    ~OmegaRubyMobiclipDecoder() {
+    MobiclipStream(u32 width_, u32 height_) : width(width_), height(height_) {
+        const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_MOBICLIP);
+        context = codec ? avcodec_alloc_context3(codec) : nullptr;
+        if (!context)
+            return;
+        context->width = static_cast<int>(width);
+        context->height = static_cast<int>(height);
+        context->thread_count = 1;
+        if (avcodec_open2(context, codec, nullptr) < 0) {
+            avcodec_free_context(&context);
+            return;
+        }
+        frame = av_frame_alloc();
+    }
+
+    ~MobiclipStream() {
         if (frame)
             av_frame_free(&frame);
         if (context)
             avcodec_free_context(&context);
     }
 
-    bool Decode(Memory::MemorySystem& memory, u32 state) {
-        if (!Initialize())
-            return false;
+    MobiclipStream(const MobiclipStream&) = delete;
+    MobiclipStream& operator=(const MobiclipStream&) = delete;
 
-        const u32 input_address = memory.Read32(state);
-        memory.ReadBlock(input_address, input.data(), OmegaRubyMobiclipInputSize);
-
-        // MOFLEX stores 16-bit words in the byte order expected by the 3DS decoder. FFmpeg's
-        // MobiClip decoder performs the same word swap internally. Its bit reader stops at the
-        // frame terminator, so a padded upper bound is safe and avoids guest container parsing.
-        AVPacket packet{};
-        packet.data = input.data();
-        packet.size = static_cast<int>(OmegaRubyMobiclipInputSize);
-
-        if (memory.Read8(input_address + 1) & 0x80)
-            avcodec_flush_buffers(context);
-        av_frame_unref(frame);
-        if (avcodec_send_packet(context, &packet) < 0 ||
-            avcodec_receive_frame(context, frame) < 0) {
-            avcodec_flush_buffers(context);
-            return false;
-        }
-
-        u8* y_output = memory.GetPointer(memory.Read32(state + 0x0C));
-        u8* uv_output = memory.GetPointer(memory.Read32(state + 0x24));
-        if (!y_output || !uv_output)
-            return false;
-        for (int row = 0; row < 240; ++row) {
-            std::memcpy(y_output + row * 512, frame->data[0] + row * frame->linesize[0], 400);
-        }
-        for (int row = 0; row < 120; ++row) {
-            std::memcpy(uv_output + row * 512, frame->data[1] + row * frame->linesize[1], 200);
-            std::memcpy(uv_output + row * 512 + 256,
-                        frame->data[2] + row * frame->linesize[2], 200);
-        }
-        return true;
-    }
-
-private:
-    bool Initialize() {
-        if (context)
-            return true;
-        const AVCodec* codec = avcodec_find_decoder(AV_CODEC_ID_MOBICLIP);
-        context = codec ? avcodec_alloc_context3(codec) : nullptr;
-        if (!context)
-            return false;
-        context->width = 400;
-        context->height = 240;
-        context->thread_count = 1;
-        if (avcodec_open2(context, codec, nullptr) < 0) {
-            avcodec_free_context(&context);
-            return false;
-        }
-        frame = av_frame_alloc();
-        return frame != nullptr;
+    bool Usable() const {
+        return context && frame;
     }
 
     AVCodecContext* context{};
     AVFrame* frame{};
-    std::array<u8, OmegaRubyMobiclipInputSize + AV_INPUT_BUFFER_PADDING_SIZE> input{};
+    u32 width;
+    u32 height;
+    /// FFmpeg's reference frames match the guest's: every frame since a keyframe decoded here.
+    bool in_sync = false;
 };
 
-thread_local OmegaRubyMobiclipDecoder omega_ruby_mobiclip_decoder;
+class NativeMobiclipDecoder {
+public:
+    /// Decodes the frame the state describes into luma/chroma (the guest layout, stride apart).
+    /// False leaves the frame to the guest decoder.
+    bool Decode(Memory::MemorySystem& memory, u32 state, u32 stride) {
+        width = memory.Read32(state + 4);
+        height = memory.Read32(state + 8);
+        if (width == 0 || height == 0 || width > stride || height > 1024 || width % 16 != 0 ||
+            height % 16 != 0) {
+            return false;
+        }
+        auto& stream = streams[state];
+        if (!stream || stream->width != width || stream->height != height) {
+            if (streams.size() > 8) {  // states the game has since freed
+                streams.clear();
+                return false;
+            }
+            stream = std::make_unique<MobiclipStream>(width, height);
+        }
+        if (!stream->Usable())
+            return false;
+
+        // The first 16-bit word's top bit marks a keyframe. A P-frame decodes only while FFmpeg's
+        // references are the guest's; after a frame the guest decoded, wait for a keyframe.
+        const u32 input_address = memory.Read32(state);
+        const bool keyframe = (memory.Read8(input_address + 1) & 0x80) != 0;
+        if (!keyframe && !stream->in_sync)
+            return false;
+
+        // The packet's size isn't passed in. FFmpeg's bit reader stops at the frame's end, so
+        // read an upper bound: a keyframe can take more than one byte per pixel at low
+        // quantizers (padding as FFmpeg requires).
+        const std::size_t input_size =
+            std::min<std::size_t>(MobiclipMaxInputSize, std::size_t{width} * height * 2);
+        memory.ReadBlock(input_address, input.data(), input_size);
+        std::fill_n(input.data() + input_size, AV_INPUT_BUFFER_PADDING_SIZE, u8{0});
+
+        AVPacket packet{};
+        packet.data = input.data();
+        packet.size = static_cast<int>(input_size);
+
+        AVFrame* frame = stream->frame;
+        av_frame_unref(frame);
+        const int sent = avcodec_send_packet(stream->context, &packet);
+        const int received = sent < 0 ? 0 : avcodec_receive_frame(stream->context, frame);
+        if (sent < 0 || received < 0) {
+            static int reported = 0;
+            if (reported++ < 10) {
+                LOG_WARNING(Kernel_SVC,
+                            "MobiClip: FFmpeg could not decode a {}x{} {} ({}, {}); the game's "
+                            "decoder takes over until the next keyframe",
+                            width, height, keyframe ? "keyframe" : "P-frame", sent, received);
+            }
+            stream->in_sync = false;
+            return false;
+        }
+        stream->in_sync = true;
+
+        luma.assign(static_cast<std::size_t>(stride) * height, 0);
+        chroma.assign(static_cast<std::size_t>(stride) * height / 2, 0);
+        for (u32 row = 0; row < height; ++row) {
+            std::memcpy(luma.data() + row * stride, frame->data[0] + row * frame->linesize[0],
+                        width);
+        }
+        for (u32 row = 0; row < height / 2; ++row) {
+            std::memcpy(chroma.data() + row * stride, frame->data[1] + row * frame->linesize[1],
+                        width / 2);
+            std::memcpy(chroma.data() + row * stride + stride / 2,
+                        frame->data[2] + row * frame->linesize[2], width / 2);
+        }
+        return true;
+    }
+
+    /// Writes the decoded frame where the guest decoder would have.
+    bool Write(Memory::MemorySystem& memory, u32 state, u32 stride) const {
+        u8* y_output = memory.GetPointer(memory.Read32(state + 0x0C));
+        u8* uv_output = memory.GetPointer(memory.Read32(state + 0x24));
+        if (!y_output || !uv_output)
+            return false;
+        for (u32 row = 0; row < height; ++row)
+            std::memcpy(y_output + row * stride, luma.data() + row * stride, width);
+        for (u32 row = 0; row < height / 2; ++row) {
+            std::memcpy(uv_output + row * stride, chroma.data() + row * stride, width / 2);
+            std::memcpy(uv_output + row * stride + stride / 2,
+                        chroma.data() + row * stride + stride / 2, width / 2);
+        }
+        return true;
+    }
+
+    u32 width = 0;
+    u32 height = 0;
+    std::vector<u8> luma;
+    std::vector<u8> chroma;
+
+private:
+    std::unordered_map<u32, std::unique_ptr<MobiclipStream>> streams;
+    std::array<u8, MobiclipMaxInputSize + AV_INPUT_BUFFER_PADDING_SIZE> input{};
+};
+
+thread_local NativeMobiclipDecoder native_mobiclip_decoder;
+
 } // namespace
 
-void SVC::OmegaRubyMobiclipDecode() {
+void SetNativeMobiclipBody(u32 stride, u32 guest_body) {
+    for (std::size_t i = 0; i < MobiclipStrides.size(); ++i) {
+        if (MobiclipStrides[i] == stride)
+            mobiclip_guest_body[i] = guest_body;
+    }
+}
+
+void SVC::NativeMobiclipDecode(std::size_t variant) {
     const u32 state = GetReg(0);
-    if (omega_ruby_mobiclip_decoder.Decode(memory, state)) {
+    const u32 stride = MobiclipStrides[variant];
+    auto& decoder = native_mobiclip_decoder;
+    if (decoder.Decode(memory, state, stride) && decoder.Write(memory, state, stride)) {
         // The verified caller overwrites r0 immediately after this call. Return zero and preserve
         // the incoming caller-clobbered registers; the output image is the observable result.
         SetReg(0, 0);
@@ -615,13 +711,24 @@ void SVC::OmegaRubyMobiclipDecode() {
         return;
     }
 
-    // Native decode is an optimization. Resume the original function body on any failure.
+    // Native decode is an optimization. Resume the original function body on any failure,
+    // after the push the patched entry instruction did.
     const u32 stack = GetReg(13) - 40;
     for (u32 reg = 4; reg <= 12; ++reg)
         memory.Write32(stack + (reg - 4) * 4, GetReg(reg));
     memory.Write32(stack + 36, GetReg(14));
     SetReg(13, stack);
-    system.GetRunningCore().SetPC(OmegaRubyMobiclipGuestBody);
+    system.GetRunningCore().SetPC(mobiclip_guest_body[variant]);
+}
+
+void SVC::NativeMobiclipDecode256() {
+    NativeMobiclipDecode(0);
+}
+void SVC::NativeMobiclipDecode512() {
+    NativeMobiclipDecode(1);
+}
+void SVC::NativeMobiclipDecode1024() {
+    NativeMobiclipDecode(2);
 }
 #endif
 
@@ -1761,6 +1868,12 @@ Result SVC::CancelTimer(Handle handle) {
 }
 
 /// Sleep the current thread
+/// Tamariba: the idle slot of Game Freak's movie demux loop (see ldr_ro.cpp). Sleeps 1 ms; the
+/// loop sets r0 again right after, so a wake-up result written there does no harm.
+void SVC::MovieThreadIdle() {
+    SleepThread(1'000'000);
+}
+
 void SVC::SleepThread(s64 nanoseconds) {
     LOG_TRACE(Kernel_SVC, "called nanoseconds={}", nanoseconds);
 
@@ -2486,15 +2599,19 @@ const std::array<SVC::FunctionDef, 180> SVC::SVC_Table{{
     {0x7D, &SVC::Wrap<&SVC::QueryProcessMemory, 0x7D>, "QueryProcessMemory", 1000},
     // Custom SVCs
 #ifdef AZAHAR_MVD_FFMPEG
-    {0x7E, nullptr, "Unused", 1000},
-    {0x7F, &SVC::OmegaRubyMobiclipDecode, "OmegaRubyMobiclipDecode", 0},
+    {0x7E, &SVC::NativeMobiclipDecode256, "NativeMobiclipDecode256", 0},
+    {0x7F, &SVC::NativeMobiclipDecode512, "NativeMobiclipDecode512", 0},
 #else
     {0x7E, nullptr, "Unused", 1000},
     {0x7F, nullptr, "Unused", 1000},
 #endif
     {0x80, nullptr, "CustomBackdoor", 1000},
+#ifdef AZAHAR_MVD_FFMPEG
+    {0x81, &SVC::NativeMobiclipDecode1024, "NativeMobiclipDecode1024", 0},
+#else
     {0x81, nullptr, "Unused", 1000},
-    {0x82, nullptr, "Unused", 1000},
+#endif
+    {0x82, &SVC::MovieThreadIdle, "MovieThreadIdle", 0},
     {0x83, nullptr, "Unused", 1000},
     {0x84, nullptr, "Unused", 1000},
     {0x85, nullptr, "Unused", 1000},

@@ -34,6 +34,13 @@ public:
     explicit CROHelper(VAddr cro_address, Kernel::Process& process, Core::System& system)
         : module_address(cro_address), process(process), system(system) {}
 
+    /// The caller invalidates [module, module + size) itself once it is done (LoadCRO and
+    /// UnloadCRO do), so relocations inside it skip their own JIT invalidation: one per relocated
+    /// word, tens of thousands per module, each taking the JIT's lock and growing its range set.
+    void CoverOwnInvalidation(u32 size) {
+        self_invalidation_end = module_address + size;
+    }
+
     std::string ModuleName() const {
         return system.Memory().ReadCString(GetField(ModuleNameOffset), GetField(ModuleNameSize));
     }
@@ -140,6 +147,10 @@ public:
 
 private:
     const VAddr module_address; ///< the virtual address of this module
+    VAddr self_invalidation_end = 0; ///< see CoverOwnInvalidation
+
+    /// Tells the JIT a relocated word changed, unless CoverOwnInvalidation covers it.
+    void InvalidateRelocated(VAddr target_address);
     Kernel::Process& process;   ///< the owner process of this module
     Core::System& system;
 

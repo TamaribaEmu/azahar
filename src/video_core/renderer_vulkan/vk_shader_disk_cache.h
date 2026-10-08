@@ -356,6 +356,11 @@ private:
 
     tsl::robin_map<u64, std::unique_ptr<GraphicsPipeline>, Common::IdentityHash<u64>>
         graphics_pipelines;
+    // The previous draw's pipeline state and pipeline (GetPipeline): most draws use the same
+    // pipeline as the one before, and the state is compared bytewise (HashableStruct zeroes its
+    // padding), so two hashes and two hash-table operations per draw are skipped.
+    Common::HashableStruct<StaticPipelineInfo> memo_state;
+    GraphicsPipeline* memo_pipeline = nullptr;
     std::unordered_set<u64> known_graphic_pipelines;
 };
 

@@ -1057,6 +1057,8 @@ void RendererVulkan::DrawScreens(Frame* frame, const Layout::FramebufferLayout& 
     DrawCursor(layout);
 
     scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRenderPass(); });
+    // The present pipeline and its sets are bound now: the next draw binds its own again.
+    scheduler.MakeDirty(StateFlags::Pipeline);
 }
 
 void RendererVulkan::DrawCursor(const Layout::FramebufferLayout& layout) {
@@ -1171,7 +1173,11 @@ void RendererVulkan::SwapBuffers() {
     }
 #endif
     if (!screenRendered) {
-        scheduler.Finish();
+        // A VBlank without a new game frame (duplicate-frame skipping) used to Finish here,
+        // draining the GPU and blocking the emulation thread mid-frame on 30 fps titles.
+        // Nothing after this needs the GPU done (the rasterizer cache frees surfaces by GPU
+        // tick, not by frame), so submitting is enough.
+        scheduler.Flush();
     }
 
     system.perf_stats->EndSwap();

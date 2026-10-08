@@ -128,7 +128,13 @@ if ("x86_64" IN_LIST ARCHITECTURE OR "arm64" IN_LIST ARCHITECTURE)
         set(DYNARMIC_TESTS OFF CACHE BOOL "")
         set(DYNARMIC_FRONTENDS "A32" CACHE STRING "")
         set(DYNARMIC_USE_PRECOMPILED_HEADERS ${CITRA_USE_PRECOMPILED_HEADERS} CACHE BOOL "")
+        # src/ turns LTO on for its own directory only; the JIT's dispatcher, memory
+        # trampolines and invalidation path are called every slice, so they join it.
+        if (ENABLE_LTO)
+            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+        endif()
         add_subdirectory(dynarmic EXCLUDE_FROM_ALL)
+        unset(CMAKE_INTERPROCEDURAL_OPTIMIZATION)
     endif()
 endif()
 

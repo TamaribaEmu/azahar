@@ -23,16 +23,21 @@ RenderManager::~RenderManager() = default;
 
 void RenderManager::BeginRendering(const Framebuffer* framebuffer,
                                    Common::Rectangle<u32> draw_rect) {
-    const vk::Rect2D render_area = {
-        .offset{
-            .x = static_cast<s32>(draw_rect.left),
-            .y = static_cast<s32>(draw_rect.bottom),
-        },
-        .extent{
-            .width = draw_rect.GetWidth(),
-            .height = draw_rect.GetHeight(),
-        },
+    // The whole framebuffer, not the draw rect: the draw rect moves with the viewport, and a
+    // new render area ended the pass and began another (with its barriers) every time a UI or
+    // multi-viewport scene moved it. Each draw is still kept inside its draw rect by the dynamic
+    // scissor (RasterizerVulkan::Draw), and the passes load and store, so pixels outside it are
+    // kept as they were. An immediate-mode GPU (the Shield's) pays nothing for the larger area.
+    vk::Rect2D render_area = {
+        .offset{.x = 0, .y = 0},
+        .extent{.width = framebuffer->Width(), .height = framebuffer->Height()},
     };
+    if (render_area.extent.width == 0 || render_area.extent.height == 0) [[unlikely]] {
+        render_area = vk::Rect2D{
+            vk::Offset2D{static_cast<s32>(draw_rect.left), static_cast<s32>(draw_rect.bottom)},
+            vk::Extent2D{draw_rect.GetWidth(), draw_rect.GetHeight()},
+        };
+    }
     const RenderPass new_pass = {
         .framebuffer = framebuffer->Handle(),
         .render_pass = framebuffer->RenderPass(),

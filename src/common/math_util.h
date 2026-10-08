@@ -58,6 +58,9 @@ struct Rectangle {
     [[nodiscard]] T GetHeight() const {
         return std::abs(static_cast<std::make_signed_t<T>>(bottom - top));
     }
+    [[nodiscard]] T GetArea() const {
+        return GetWidth() * GetHeight();
+    }
     [[nodiscard]] Rectangle<T> TranslateX(const T x) const {
         return Rectangle{left + x, top, right + x, bottom};
     }

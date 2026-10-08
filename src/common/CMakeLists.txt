@@ -99,6 +99,7 @@ add_library(citra_common STATIC EXCLUDE_FROM_ALL
     timer.cpp
     timer.h
     unique_function.h
+    unroll.h
     vector_math.h
     web_util.cpp
     web_util.h
@@ -174,11 +175,6 @@ find_library(BACKTRACE_LIBRARY backtrace)
 if (BACKTRACE_LIBRARY AND ${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL GNU)
     target_link_libraries(citra_common PRIVATE ${BACKTRACE_LIBRARY} dl)
     target_compile_definitions(citra_common PRIVATE CITRA_LINUX_GCC_BACKTRACE)
-endif()
-
-if (SSE42_COMPILE_OPTION)
-    target_compile_definitions(citra_common PRIVATE CITRA_HAS_SSE42)
-    target_compile_options(citra_common PRIVATE ${SSE42_COMPILE_OPTION})
 endif()
 
 target_link_libraries(citra_common PUBLIC xxHash::xxhash)

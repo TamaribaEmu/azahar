@@ -3,14 +3,21 @@
 // Refer to the license.txt file included.
 
 #include <algorithm>
+#if defined(__ANDROID__) || defined(__GLIBC__)
+#endif
+#include <array>
+#include <cstddef>
+#include <optional>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <dynarmic/interface/A32/a32.h>
 #include <dynarmic/interface/optimization_flags.h>
 #include "common/assert.h"
 #include "common/file_util.h"
+#include "common/hash.h"
 #include "common/logging/log.h"
 #include "common/microprofile.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
@@ -43,7 +50,8 @@ constexpr u32 PersistentCacheVersion = 2;
 constexpr std::size_t PersistentCachePrimaryMaximumBlocks = 100'000;
 constexpr std::size_t PersistentCacheSecondaryMaximumBlocks = 20'000;
 constexpr u32 PersistentModuleCacheVersion = 1;
-constexpr std::size_t PersistentModuleMaximumCount = 16;
+// Ultra Moon has 21 CROs with cached blocks; at 16 the boot warm-up evicted some again.
+constexpr std::size_t PersistentModuleMaximumCount = 48;
 constexpr std::size_t PersistentModulePrimaryMaximumBlocks = 40'000;
 constexpr std::size_t PersistentModuleSecondaryMaximumBlocks = 8'000;
 
@@ -236,6 +244,83 @@ bool IsSanePersistentModuleDescriptor(u64 descriptor, u32 code_size) {
     return !single_stepping && offset < code_size && (offset & (alignment - 1)) == 0;
 }
 
+// A module's code as it was when it loaded, beside its block list ("<same name>.code").
+constexpr std::array<char, 8> PersistentModuleCodeMagic{'A', 'Z', 'C', 'R', 'O', 'C', 'O', 'D'};
+constexpr u32 PersistentModuleCodeMaximumSize = 16 * 1024 * 1024;
+
+struct PersistentModuleCodeHeader {
+    std::array<char, 8> magic;
+    u32 version;
+    u32 core_id;
+    u64 program_id;
+    u64 module_hash;
+    u64 executable_hash;
+    u32 code_start;
+    u32 code_size;
+    u64 checksum;
+};
+
+u64 PersistentModuleCodeChecksum(const PersistentModuleCodeHeader& header,
+                                 const std::vector<u8>& code) {
+    u64 hash = 1469598103934665603ULL;
+    const auto mix = [&hash](const void* data, std::size_t size) {
+        const auto* bytes = static_cast<const u8*>(data);
+        for (std::size_t i = 0; i < size; ++i) {
+            hash ^= bytes[i];
+            hash *= 1099511628211ULL;
+        }
+    };
+    mix(&header, offsetof(PersistentModuleCodeHeader, checksum));
+    mix(code.data(), code.size());
+    return hash;
+}
+
+std::string PersistentModuleCodePath(u32 core_id, u64 program_id, u64 module_hash) {
+    std::string path = PersistentModuleCachePath(core_id, program_id, module_hash);
+    return path.substr(0, path.size() - 4) + ".code";  // ".bin" -> ".code"
+}
+
+/// The header alone (to see whether a copy is already there), or with the code when `code`.
+std::optional<PersistentModuleCodeHeader> ReadPersistentModuleCode(const std::string& path,
+                                                                   std::vector<u8>* code) {
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    if (!file) {
+        return std::nullopt;
+    }
+    PersistentModuleCodeHeader header{};
+    bool ok = std::fread(&header, sizeof(header), 1, file) == 1 &&
+              header.magic == PersistentModuleCodeMagic &&
+              header.version == PersistentModuleCacheVersion && header.code_size != 0 &&
+              header.code_size % 4 == 0 && header.code_size <= PersistentModuleCodeMaximumSize;
+    if (ok && code) {
+        code->resize(header.code_size);
+        ok = std::fread(code->data(), 1, code->size(), file) == code->size() &&
+             header.checksum == PersistentModuleCodeChecksum(header, *code);
+    }
+    std::fclose(file);
+    if (!ok) {
+        return std::nullopt;
+    }
+    return header;
+}
+
+bool WritePersistentModuleCode(const std::string& path, const PersistentModuleCodeHeader& header,
+                               const std::vector<u8>& code) {
+    const std::string temporary = path + ".tmp";
+    std::FILE* file = std::fopen(temporary.c_str(), "wb");
+    if (!file) {
+        return false;
+    }
+    const bool wrote = std::fwrite(&header, sizeof(header), 1, file) == 1 &&
+                       std::fwrite(code.data(), 1, code.size(), file) == code.size();
+    const bool closed = std::fclose(file) == 0;
+    if (wrote && closed && FileUtil::Rename(temporary, path)) {
+        return true;
+    }
+    FileUtil::Delete(temporary);
+    return false;
+}
+
 std::vector<u64> ReadPersistentModuleCache(u32 core_id, u64 program_id, u64 module_hash,
                                            u32 code_size) {
     const std::string path = PersistentModuleCachePath(core_id, program_id, module_hash);
@@ -268,8 +353,8 @@ std::vector<u64> ReadPersistentModuleCache(u32 core_id, u64 program_id, u64 modu
     return descriptors;
 }
 
-std::size_t WritePersistentModuleCache(u32 core_id, u64 program_id, u64 module_hash, u32 code_size,
-                                       std::vector<u64> descriptors) {
+/// The block list as the cache file holds it: sane, sorted, unique, capped.
+void NormalizePersistentModuleDescriptors(u32 core_id, u32 code_size, std::vector<u64>& descriptors) {
     std::erase_if(descriptors, [code_size](u64 descriptor) {
         return !IsSanePersistentModuleDescriptor(descriptor, code_size);
     });
@@ -278,6 +363,15 @@ std::size_t WritePersistentModuleCache(u32 core_id, u64 program_id, u64 module_h
     if (descriptors.size() > PersistentModuleMaximumBlocks(core_id)) {
         descriptors.resize(PersistentModuleMaximumBlocks(core_id));
     }
+}
+
+u64 PersistentModuleDigest(const std::vector<u64>& descriptors) {
+    return Common::ComputeHash64(descriptors.data(), descriptors.size() * sizeof(u64));
+}
+
+std::size_t WritePersistentModuleCache(u32 core_id, u64 program_id, u64 module_hash, u32 code_size,
+                                       std::vector<u64> descriptors) {
+    NormalizePersistentModuleDescriptors(core_id, code_size, descriptors);
     if (descriptors.empty()) {
         return 0;
     }
@@ -319,6 +413,15 @@ public:
     ~DynarmicUserCallbacks() = default;
 
     std::optional<std::uint32_t> MemoryReadCode(VAddr vaddr) override {
+        if (!parent.code_override.empty()) [[unlikely]] {
+            const u32 offset = vaddr - parent.code_override_start;
+            if (offset < parent.code_override.size() &&
+                parent.code_override.size() - offset >= sizeof(u32)) {
+                u32 word;
+                std::memcpy(&word, parent.code_override.data() + offset, sizeof(word));
+                return word;
+            }
+        }
         return memory.Read32OrNullopt(vaddr);
     }
 
@@ -459,13 +562,17 @@ ARM_Dynarmic::ARM_Dynarmic(Core::System& system_, Memory::MemorySystem& memory_,
 }
 
 ARM_Dynarmic::~ARM_Dynarmic() {
-    FlushPersistentCache();
+    // System::Shutdown flushes first, while the emulation state is still whole; writing the
+    // same cache again here doubled the time a game took to close (~250 ms for 100,000 blocks).
+    if (!persistent_cache_flushed) {
+        FlushPersistentCache();
+    }
 }
 
 MICROPROFILE_DEFINE(ARM_Jit, "ARM JIT", "ARM JIT", MP_RGB(255, 64, 64));
 
 void ARM_Dynarmic::Run() {
-    ASSERT(memory.GetCurrentPageTable() == current_page_table);
+    ASSERT(memory.GetCurrentPageTableRaw() == current_page_table.get());
     LoadPersistentModulesIfReady();
     MICROPROFILE_SCOPE(ARM_Jit);
     if (break_flag) [[unlikely]] {
@@ -612,6 +719,12 @@ std::shared_ptr<Memory::PageTable> ARM_Dynarmic::GetPageTable() const {
 }
 
 void ARM_Dynarmic::SetPageTable(const std::shared_ptr<Memory::PageTable>& page_table) {
+    if (jit && page_table == current_page_table) [[likely]] {
+        // Same process: the live JIT already holds this context. RunLoop switches cores
+        // twice per slice, so skipping the save/lookup/load round trip here pays.
+        LoadPersistentCacheIfReady();
+        return;
+    }
     current_page_table = page_table;
     ThreadContext ctx{};
     if (jit) {
@@ -642,6 +755,7 @@ void ARM_Dynarmic::ConfigurePersistentCache(u64 program_id, u64 code_hash, u32 c
     persistent_cache_code_size = code_size;
     persistent_cache_page_table = page_table;
     persistent_cache_loaded = false;
+    persistent_cache_flushed = false;
     LOG_INFO(Core_ARM11,
              "Configured persistent Dynarmic cache for {:016X}, code {:08X}-{:08X}, hash {:016X}",
              persistent_cache_program_id, persistent_cache_code_start,
@@ -665,23 +779,150 @@ void ARM_Dynarmic::LoadPersistentCacheIfReady() {
     if (descriptors.empty()) {
         LOG_INFO(Core_ARM11, "No persistent Dynarmic cache found for {:016X}",
                  persistent_cache_program_id);
+    } else {
+        const auto started = std::chrono::steady_clock::now();
+        const std::size_t compiled = jit->Precompile(descriptors);
+        const double elapsed_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+                .count();
+        LOG_INFO(Core_ARM11,
+                 "Precompiled {} persistent Dynarmic blocks for {:016X} core {} in {:.1f} ms",
+                 compiled, persistent_cache_program_id, GetID(), elapsed_ms);
+    }
+    PrewarmPersistentModules();
+}
+
+void ARM_Dynarmic::SavePersistentModuleCode(const PersistentModule& module) {
+    // One copy per module and version; the modules' code is the same on every core.
+    if (GetID() != 0 || module.code_size == 0 || module.code_size % 4 != 0 ||
+        module.code_size > PersistentModuleCodeMaximumSize ||
+        saved_module_code.contains({module.hash, module.executable_hash})) {
+        return;
+    }
+    const std::string path =
+        PersistentModuleCodePath(GetID(), persistent_cache_program_id, module.hash);
+    const auto existing = ReadPersistentModuleCode(path, nullptr);
+    if (existing && existing->executable_hash == module.executable_hash &&
+        existing->code_start == module.code_start && existing->code_size == module.code_size) {
+        saved_module_code.insert({module.hash, module.executable_hash});
+        return;
+    }
+    std::vector<u8> code(module.code_size);
+    for (u32 offset = 0; offset < module.code_size; offset += 4) {
+        const auto word = memory.Read32OrNullopt(module.code_start + offset);
+        if (!word) {
+            return;  // not all mapped: nothing worth keeping
+        }
+        std::memcpy(code.data() + offset, &*word, sizeof(u32));
+    }
+    PersistentModuleCodeHeader header{PersistentModuleCodeMagic,
+                                      PersistentModuleCacheVersion,
+                                      GetID(),
+                                      persistent_cache_program_id,
+                                      module.hash,
+                                      module.executable_hash,
+                                      module.code_start,
+                                      module.code_size,
+                                      0};
+    header.checksum = PersistentModuleCodeChecksum(header, code);
+    if (WritePersistentModuleCode(path, header, code)) {
+        saved_module_code.insert({module.hash, module.executable_hash});
+        LOG_INFO(Core_ARM11, "Saved the code of CRO module {:016X} ({} KiB) for boot warm-up",
+                 module.hash, module.code_size / 1024);
+    }
+}
+
+void ARM_Dynarmic::PrewarmPersistentModules() {
+    if (GetID() != 0 || !jit) {
+        return;
+    }
+    const std::string directory =
+        FileUtil::GetUserPath(FileUtil::UserPath::CacheDir) + "dynarmic/cro/";
+    const std::string prefix = fmt::format("{:016X}-", persistent_cache_program_id);
+    const std::string suffix =
+        fmt::format("-core{}-a32-arm64-v{}.code", GetID(), PersistentModuleCacheVersion);
+    std::vector<std::string> paths;
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator(directory, error)) {
+        const std::string name = entry.path().filename().string();
+        if (name.starts_with(prefix) && name.ends_with(suffix)) {
+            paths.push_back(entry.path().string());
+        }
+    }
+    if (paths.empty()) {
         return;
     }
 
     const auto started = std::chrono::steady_clock::now();
-    const std::size_t compiled = jit->Precompile(descriptors);
-    const double elapsed_ms =
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
-            .count();
+    std::size_t modules = 0;
+    std::size_t blocks = 0;
+    for (const std::string& path : paths) {
+        std::vector<u8> code;
+        const auto header = ReadPersistentModuleCode(path, &code);
+        if (!header || header->core_id != GetID() ||
+            header->program_id != persistent_cache_program_id) {
+            continue;
+        }
+        const bool known = std::any_of(
+            dormant_modules.begin(), dormant_modules.end(), [&header](const DormantModule& m) {
+                return m.hash == header->module_hash && m.code_start == header->code_start &&
+                       m.code_size == header->code_size;
+            });
+        if (known) {
+            continue;
+        }
+        auto descriptors = ReadPersistentModuleCache(GetID(), persistent_cache_program_id,
+                                                     header->module_hash, header->code_size);
+        if (descriptors.empty()) {
+            continue;
+        }
+        for (u64& descriptor : descriptors) {
+            descriptor = (descriptor & 0xFFFFFFFF00000000ULL) |
+                         static_cast<u32>(header->code_start + static_cast<u32>(descriptor));
+        }
+
+        // Compile from the saved copy, record the blocks with their instruction hashes, then
+        // take them out of the lookup: they stay in the code cache as dormant blocks, which
+        // ReactivateBlocks brings back (after checking each against the real code) when the
+        // game loads the module.
+        code_override_start = header->code_start;
+        code_override = std::move(code);
+        jit->InvalidateCacheRangeNow(header->code_start, header->code_size);
+        jit->Precompile(descriptors);
+        auto entries = jit->GetCompiledBlockEntries(header->code_start, header->code_size);
+        jit->InvalidateCacheRangeNow(header->code_start, header->code_size);
+        code_override.clear();
+        code_override.shrink_to_fit();
+        std::erase_if(entries, [&header](const auto& entry) {
+            return !IsSanePersistentDescriptor(entry.descriptor, header->code_start,
+                                               header->code_size);
+        });
+        if (entries.empty()) {
+            continue;
+        }
+        if (dormant_modules.size() >= PersistentModuleMaximumCount) {
+            dormant_modules.erase(dormant_modules.begin());
+        }
+        blocks += entries.size();
+        ++modules;
+        dormant_modules.push_back({header->module_hash, header->executable_hash,
+                                   header->code_start, header->code_size, std::move(entries)});
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+    const auto cache = jit->GetAndResetCacheStats();
     LOG_INFO(Core_ARM11,
-             "Precompiled {} persistent Dynarmic blocks for {:016X} core {} in {:.1f} ms", compiled,
-             persistent_cache_program_id, GetID(), elapsed_ms);
+             "Warmed up {} CRO modules ({} blocks) for {:016X} core {} in {:.1f} ms; JIT code "
+             "cache {} of {} MiB",
+             modules, blocks, persistent_cache_program_id, GetID(),
+             std::chrono::duration<double, std::milli>(elapsed).count(),
+             cache.used_bytes >> 20, cache.capacity_bytes >> 20);
 }
 
 void ARM_Dynarmic::FlushPersistentCache() {
     if (persistent_cache_program_id == 0 || !persistent_cache_page_table) {
         return;
     }
+    persistent_cache_flushed = true;
     const auto iter = jits.find(persistent_cache_page_table);
     if (iter == jits.end()) {
         LOG_WARNING(Core_ARM11,
@@ -740,8 +981,20 @@ void ARM_Dynarmic::RegisterPersistentModule(u64 module_hash, u64 executable_hash
         return;
     }
 
-    auto descriptors =
-        ReadPersistentModuleCache(GetID(), persistent_cache_program_id, module_hash, code_size);
+    auto cached = module_descriptor_cache.find(module_hash);
+    if (cached == module_descriptor_cache.end()) {
+        cached = module_descriptor_cache
+                     .emplace(module_hash, ReadPersistentModuleCache(GetID(),
+                                                                     persistent_cache_program_id,
+                                                                     module_hash, code_size))
+                     .first;
+    }
+    auto descriptors = cached->second;
+    if (!descriptors.empty() && !saved_module_digests.contains(module_hash)) {
+        auto on_disk = descriptors;
+        NormalizePersistentModuleDescriptors(GetID(), code_size, on_disk);
+        saved_module_digests[module_hash] = PersistentModuleDigest(on_disk);
+    }
     for (u64& descriptor : descriptors) {
         descriptor = (descriptor & 0xFFFFFFFF00000000ULL) |
                      static_cast<u32>(code_start + static_cast<u32>(descriptor));
@@ -767,6 +1020,7 @@ void ARM_Dynarmic::RegisterPersistentModule(u64 module_hash, u64 executable_hash
     }
     persistent_modules.push_back({module_hash, executable_hash, code_start, code_size,
                                   std::move(descriptors), std::move(dormant_blocks)});
+    SavePersistentModuleCode(persistent_modules.back());
 }
 
 void ARM_Dynarmic::LoadPersistentModulesIfReady() {
@@ -799,9 +1053,8 @@ void ARM_Dynarmic::LoadPersistentModulesIfReady() {
 
         const auto started = std::chrono::steady_clock::now();
         const std::size_t compiled = jit->Precompile(module.pending_descriptors);
-        const double elapsed_ms =
-            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
-                .count();
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
         LOG_INFO(Core_ARM11,
                  "Eagerly precompiled {} persistent CRO blocks for {:016X} module {:016X} core {} "
                  "in {:.1f} ms",
@@ -816,17 +1069,33 @@ void ARM_Dynarmic::FlushPersistentModule(const PersistentModule& module) {
     if (jit_iter == jits.end()) {
         return;
     }
-    auto descriptors = jit_iter->second->GetCompiledBlockDescriptors();
-    std::erase_if(descriptors, [&module](u64 descriptor) {
-        return !IsSanePersistentDescriptor(descriptor, module.code_start, module.code_size);
-    });
+    std::vector<u64> descriptors;
+    {
+        descriptors =
+            jit_iter->second->GetCompiledBlockDescriptors(module.code_start, module.code_size);
+        std::erase_if(descriptors, [&module](u64 descriptor) {
+            return !IsSanePersistentDescriptor(descriptor, module.code_start, module.code_size);
+        });
+    }
     for (u64& descriptor : descriptors) {
         descriptor = (descriptor & 0xFFFFFFFF00000000ULL) |
                      static_cast<u32>(static_cast<u32>(descriptor) - module.code_start);
     }
+    // Unchanged since it was read or last written (the usual case once a module has been
+    // played): nothing to write. This ran at every module unload and cost 25-35 ms.
+    NormalizePersistentModuleDescriptors(GetID(), module.code_size, descriptors);
+    const u64 digest = PersistentModuleDigest(descriptors);
+    if (const auto known = saved_module_digests.find(module.hash);
+        known != saved_module_digests.end() && known->second == digest) {
+        return;
+    }
     const std::size_t saved =
         WritePersistentModuleCache(GetID(), persistent_cache_program_id, module.hash,
                                    module.code_size, std::move(descriptors));
+    if (saved != 0) {
+        saved_module_digests[module.hash] = digest;
+        module_descriptor_cache.erase(module.hash);  // read the file as written next time
+    }
     LOG_INFO(Core_ARM11, "Saved {} persistent CRO blocks for module {:016X} core {}", saved,
              module.hash, GetID());
 }
@@ -847,12 +1116,19 @@ void ARM_Dynarmic::CheckpointPersistentModule(u32 code_start, u64 executable_has
         [code_start](const PersistentModule& module) { return module.code_start == code_start; });
     if (iter != persistent_modules.end()) {
         FlushPersistentModule(*iter);
-        auto entries = jit->GetCompiledBlockEntries();
+        auto entries = [&] {
+            return jit->GetCompiledBlockEntries(iter->code_start, iter->code_size);
+        }();
         std::erase_if(entries, [&module = *iter](const auto& entry) {
             return !IsSanePersistentDescriptor(entry.descriptor, module.code_start,
                                                module.code_size);
         });
-        if (executable_hash == iter->executable_hash && !entries.empty()) {
+        // Not only when the module's code is as it was at load: a module loaded after this one
+        // may have patched its imports in and still be loaded (DllBackGround into DllBattle in
+        // Omega Ruby), and then no block would ever be kept. ReactivateBlocks checks each block's
+        // own instructions again before reusing it, so a changed block is simply compiled anew.
+        (void)executable_hash;
+        if (!entries.empty()) {
             const auto existing = std::find_if(
                 dormant_modules.begin(), dormant_modules.end(),
                 [&module = *iter](const DormantModule& dormant) {

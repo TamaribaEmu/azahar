@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <chrono>
 #include "common/alignment.h"
 #include "common/literals.h"
 #include "common/logging/log.h"
@@ -562,6 +563,11 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
         return true;
     }
 
+    const auto draw_rect = fb_helper.DrawRect();
+    if (draw_rect.GetArea() == 0) {
+        return true;
+    }
+
     pipeline_info.state.attachments.color = framebuffer->Format(SurfaceType::Color);
     pipeline_info.state.attachments.depth = framebuffer->Format(SurfaceType::Depth);
 
@@ -590,7 +596,6 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     UploadUniforms(accelerate);
 
     // Begin rendering
-    const auto draw_rect = fb_helper.DrawRect();
     renderpass_cache.BeginRendering(framebuffer, draw_rect);
 
     // Configure viewport and scissor
@@ -631,6 +636,67 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
     using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
 
     const auto pica_textures = regs.texturing.GetTextures();
+    // Cube maps bind six faces through their own helpers: the full path, and no reuse.
+    if (pica_textures[0].enabled && (pica_textures[0].config.type == TextureType::ShadowCube ||
+                                     pica_textures[0].config.type == TextureType::TextureCube)) {
+        texture_set_cache.valid = false;
+        SyncTextureUnitsWritten(framebuffer);
+        return;
+    }
+
+    // What each unit binds, with the same lookups (and their uploads and flags) as always.
+    std::array<TextureBinding, 3> bindings{};
+    for (u32 texture_index = 0; texture_index < pica_textures.size(); ++texture_index) {
+        const auto& texture = pica_textures[texture_index];
+        TextureBinding& binding = bindings[texture_index];
+
+        if (!texture.enabled) {
+            const bool cube = texture.config.type == TextureType::TextureCube ||
+                              texture.config.type == TextureType::ShadowCube;
+            const auto null_id = cube ? VideoCore::NULL_SURFACE_CUBE_ID : VideoCore::NULL_SURFACE_ID;
+            binding = {res_cache.GetSurface(null_id).ImageView(),
+                       res_cache.GetSampler(null_id).Handle()};
+            continue;
+        }
+
+        if (texture_index == 0 && texture.config.type == TextureType::Shadow2D) {
+            Surface& surface = res_cache.GetTextureSurface(texture);
+            Sampler& sampler = res_cache.GetSampler(texture.config);
+            surface.flags |= VideoCore::SurfaceFlagBits::ShadowSource;
+            binding = {surface.StorageView(), sampler.Handle()};
+            continue;
+        }
+
+        Surface& surface = res_cache.GetTextureSurface(texture);
+        Sampler& sampler = res_cache.GetSampler(texture.config);
+        const vk::ImageView color_view = framebuffer->ImageView(SurfaceType::Color);
+        const bool is_feedback_loop = color_view == surface.FramebufferView();
+        binding = {is_feedback_loop ? surface.CopyImageView() : surface.ImageView(),
+                   sampler.Handle()};
+    }
+
+    // The same three bindings as the previous draw, within the same submission: bind the set
+    // already written. Not across a submission: the heap hands a set out again once the GPU
+    // has finished the submission it was last committed in, which knows nothing of reuse.
+    const u64 tick = scheduler.CurrentTick();
+    if (texture_set_cache.valid && texture_set_cache.tick == tick &&
+        texture_set_cache.bindings == bindings) {
+        pipeline_cache.Rebind(DescriptorHeapType::Texture, texture_set_cache.set);
+        return;
+    }
+
+    const auto texture_set = pipeline_cache.Acquire(DescriptorHeapType::Texture);
+    for (u32 texture_index = 0; texture_index < bindings.size(); ++texture_index) {
+        update_queue.AddImageSampler(texture_set, texture_index, 0, bindings[texture_index].view,
+                                     bindings[texture_index].sampler);
+    }
+    texture_set_cache = {.bindings = bindings, .set = texture_set, .tick = tick, .valid = true};
+}
+
+void RasterizerVulkan::SyncTextureUnitsWritten(const Framebuffer* framebuffer) {
+    using TextureType = Pica::TexturingRegs::TextureConfig::TextureType;
+
+    const auto pica_textures = regs.texturing.GetTextures();
     const bool use_cube_heap =
         pica_textures[0].enabled && pica_textures[0].config.type == TextureType::ShadowCube;
     const auto texture_set = pipeline_cache.Acquire(use_cube_heap ? DescriptorHeapType::Texture
@@ -641,10 +707,23 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
 
         // If the texture unit is disabled bind a null surface to it
         if (!texture.enabled) {
-            Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
-            const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SAMPLER_ID);
-            update_queue.AddImageSampler(texture_set, texture_index, 0, null_surface.ImageView(),
-                                         null_sampler.Handle());
+            switch (texture.config.type.Value()) {
+            case TextureType::TextureCube:
+            case TextureType::ShadowCube: {
+                Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_CUBE_ID);
+                const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SURFACE_CUBE_ID);
+                update_queue.AddImageSampler(texture_set, texture_index, 0,
+                                             null_surface.ImageView(), null_sampler.Handle());
+                break;
+            }
+            default: {
+                Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
+                const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SURFACE_ID);
+                update_queue.AddImageSampler(texture_set, texture_index, 0,
+                                             null_surface.ImageView(), null_sampler.Handle());
+                break;
+            }
+            }
             continue;
         }
 
@@ -684,13 +763,41 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
 }
 
 void RasterizerVulkan::SyncUtilityTextures(const Framebuffer* framebuffer) {
-    const bool shadow_rendering = regs.framebuffer.IsShadowRendering();
-    if (!shadow_rendering) {
-        return;
+    const bool shadow_writing = regs.framebuffer.IsShadowRendering();
+    bool shadow_reading = regs.lighting.config0.enable_shadow;
+    // Ensure the shadow-texture slot is actually enabled
+    if (shadow_reading) {
+        const u32 shadow_texture_unit = regs.lighting.config0.shadow_selector.Value();
+        const auto shadow_texture = regs.texturing.GetTextures()[shadow_texture_unit];
+        shadow_reading &= shadow_texture.enabled;
     }
 
+    // Reading and writing are mutually exclusive
+    assert(!(shadow_writing && shadow_reading));
+
+    vk::ImageView view;
+    if (shadow_writing) {
+        view = framebuffer->ImageView(SurfaceType::Color);
+    } else if (shadow_reading) {
+        const u32 shadow_texture_unit = regs.lighting.config0.shadow_selector.Value();
+        const auto shadow_texture = regs.texturing.GetTextures()[shadow_texture_unit];
+        Surface& shadow_surface = res_cache.GetTextureSurface(shadow_texture);
+        view = shadow_surface.StorageView();
+    } else {
+        Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
+        view = null_surface.StorageView();
+    }
+
+    // As for the texture set (SyncTextureUnits): reused only within the same submission.
+    const u64 tick = scheduler.CurrentTick();
+    if (utility_set_cache.valid && utility_set_cache.tick == tick &&
+        utility_set_cache.view == view) {
+        pipeline_cache.Rebind(DescriptorHeapType::Utility, utility_set_cache.set);
+        return;
+    }
     const auto utility_set = pipeline_cache.Acquire(DescriptorHeapType::Utility);
-    update_queue.AddStorageImage(utility_set, 0, framebuffer->ImageView(SurfaceType::Color));
+    update_queue.AddStorageImage(utility_set, 0, view);
+    utility_set_cache = {.view = view, .set = utility_set, .tick = tick, .valid = true};
 }
 
 void RasterizerVulkan::BindShadowCube(const Pica::TexturingRegs::FullTextureConfig& texture,

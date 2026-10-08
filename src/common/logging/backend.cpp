@@ -96,7 +96,7 @@ public:
         }
 
         auto str = FormatLogMessage(entry).append(1, '\n');
-        callback(log_level, str.c_str());
+        callback(log_level, "%s", str.c_str());  // the message is text, never a format
     }
 
     void Flush() override {}
@@ -284,6 +284,9 @@ public:
         filter.ParseFilterString(Settings::values.log_filter.GetValue());
         instance = std::unique_ptr<Impl, decltype(&Deleter)>(new Impl(callback, filter), Deleter);
         initialization_in_progress_suppress_logging = false;
+        // Without this every message takes the "before initialisation" path: formatted
+        // twice and written to stderr synchronously, with no level filter.
+        logging_initialized = true;
     }
 #endif
     static void Initialize(std::string_view log_file) {

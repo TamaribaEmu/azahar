@@ -396,7 +396,13 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
 
     const bool is_dirty = scheduler.IsStateDirty(StateFlags::Pipeline);
     const bool pipeline_dirty = (current_pipeline != pipeline) || is_dirty;
-    scheduler.Record([this, is_dirty, pipeline_dirty, pipeline,
+    // The same sets and offsets as the previous bind in this command buffer: nothing to bind.
+    // Anything else that binds sets (the blit helper) marks the pipeline state dirty.
+    const bool sets_dirty = is_dirty || scheduler.IsStateDirty(StateFlags::DescriptorSets) ||
+                            bound_descriptor_sets != last_bound_sets || offsets != last_offsets;
+    last_bound_sets = bound_descriptor_sets;
+    last_offsets = offsets;
+    scheduler.Record([this, is_dirty, pipeline_dirty, sets_dirty, pipeline,
                       current_dynamic = current_info.dynamic_info, dynamic = info.dynamic_info,
                       descriptor_sets = bound_descriptor_sets, offsets = offsets,
                       current_rasterization = current_info.state.rasterization,
@@ -504,8 +510,10 @@ bool PipelineCache::BindPipeline(PipelineInfo& info, bool wait_built) {
             cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
         }
 
-        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0,
-                                  descriptor_sets, offsets);
+        if (sets_dirty) {
+            cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0,
+                                      descriptor_sets, offsets);
+        }
     });
 
     current_info = info;

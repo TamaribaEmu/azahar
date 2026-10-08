@@ -63,6 +63,12 @@ VAddr CROHelper::SegmentTagToAddress(SegmentTag segment_tag) const {
     return entry.offset + segment_tag.offset_into_segment;
 }
 
+void CROHelper::InvalidateRelocated(VAddr target_address) {
+    if (target_address >= module_address && target_address < self_invalidation_end)
+        return;
+    system.InvalidateCacheRange(target_address, sizeof(u32));
+}
+
 Result CROHelper::ApplyRelocation(VAddr target_address, RelocationType relocation_type, u32 addend,
                                   u32 symbol_address, u32 target_future_address) {
 
@@ -72,11 +78,11 @@ Result CROHelper::ApplyRelocation(VAddr target_address, RelocationType relocatio
     case RelocationType::AbsoluteAddress:
     case RelocationType::AbsoluteAddress2:
         system.Memory().Write32(target_address, symbol_address + addend);
-        system.InvalidateCacheRange(target_address, sizeof(u32));
+        InvalidateRelocated(target_address);
         break;
     case RelocationType::RelativeAddress:
         system.Memory().Write32(target_address, symbol_address + addend - target_future_address);
-        system.InvalidateCacheRange(target_address, sizeof(u32));
+        InvalidateRelocated(target_address);
         break;
     case RelocationType::ThumbBranch:
     case RelocationType::ArmBranch:
@@ -99,7 +105,7 @@ Result CROHelper::ClearRelocation(VAddr target_address, RelocationType relocatio
     case RelocationType::AbsoluteAddress2:
     case RelocationType::RelativeAddress:
         system.Memory().Write32(target_address, 0);
-        system.InvalidateCacheRange(target_address, sizeof(u32));
+        InvalidateRelocated(target_address);
         break;
     case RelocationType::ThumbBranch:
     case RelocationType::ArmBranch:
