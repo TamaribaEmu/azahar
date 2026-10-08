@@ -192,6 +192,9 @@ private:
     void DownloadFillSurface(Surface& surface, SurfaceInterval interval);
 
     /// Attempt to find a reinterpretable surface in the cache and use it to copy for validation
+    /// A color target over memory dirty only in depth buffers (see ValidateSurface).
+    bool IsReusedDepthMemory(const Surface& surface, const SurfaceInterval& interval);
+
     bool ValidateByReinterpretation(Surface& surface, SurfaceParams params,
                                     const SurfaceInterval& interval);
 

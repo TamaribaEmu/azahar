@@ -47,7 +47,11 @@ constexpr std::array<char, 8> PersistentCacheMagic{'A', 'Z', 'D', 'Y', 'N', 'A',
 constexpr u32 PersistentCacheVersion = 2;
 // Keep each emulated CPU's observed set separate. Loading a merged manifest into all four ARM11
 // JITs multiplied native code memory and created reclaim pressure on the 3 GiB Shield.
-constexpr std::size_t PersistentCachePrimaryMaximumBlocks = 100'000;
+// Smash compiles about 210,000 blocks on core 0 in a session (menus, a match, results); at
+// 100,000 the rest (the lowest addresses were kept) was compiled again every session, ~4 s of
+// stalls on the Shield at menu changes and the results screen. 300,000 blocks take about 75 of
+// the JIT's 128 MiB, and a session reaches that memory anyway; boot compiles them up front.
+constexpr std::size_t PersistentCachePrimaryMaximumBlocks = 300'000;
 constexpr std::size_t PersistentCacheSecondaryMaximumBlocks = 20'000;
 constexpr u32 PersistentModuleCacheVersion = 1;
 // Ultra Moon has 21 CROs with cached blocks; at 16 the boot warm-up evicted some again.

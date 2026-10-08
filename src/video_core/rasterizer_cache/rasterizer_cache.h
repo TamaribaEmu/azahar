@@ -1026,7 +1026,14 @@ void RasterizerCache<T>::ValidateSurface(SurfaceId surface_id, PAddr addr, u32 s
             continue;
         }
 
-        FlushRegion(params.addr, params.size);
+        // A color target over memory that only depth buffers have written is the game reusing
+        // that VRAM (Smash's depth buffer becomes an RGB565 target for its victory screens and
+        // Final Smashes). The depth bytes are never seen as color, and with no GPU conversion
+        // between the two widths, flushing them cost a full GPU sync and a 400 KiB readback
+        // every frame. What memory holds is uploaded instead.
+        if (!IsReusedDepthMemory(surface, interval)) {
+            FlushRegion(params.addr, params.size);
+        }
         if (!use_custom_textures || !UploadCustomSurface(surface_id, interval)) {
             UploadSurface(surface, interval);
         }
@@ -1201,6 +1208,23 @@ void RasterizerCache<T>::DownloadFillSurface(Surface& surface, SurfaceInterval i
     if (backup_bytes) {
         std::memcpy(&dest_ptr[coarse_start_offset], &backup_data[0], backup_bytes);
     }
+}
+
+template <class T>
+bool RasterizerCache<T>::IsReusedDepthMemory(const Surface& surface,
+                                             const SurfaceInterval& interval) {
+    if (surface.type != SurfaceType::Color) {
+        return false;
+    }
+    bool any_dirty = false;
+    for (const auto& [region, dirty_id] : RangeFromInterval(dirty_regions, interval)) {
+        const SurfaceType dirty_type = slot_surfaces[dirty_id].type;
+        if (dirty_type != SurfaceType::Depth && dirty_type != SurfaceType::DepthStencil) {
+            return false;
+        }
+        any_dirty = true;
+    }
+    return any_dirty;
 }
 
 template <class T>
