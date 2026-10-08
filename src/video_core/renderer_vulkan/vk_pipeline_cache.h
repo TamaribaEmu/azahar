@@ -159,9 +159,6 @@ private:
     std::array<DescriptorHeap, NumDescriptorHeaps> descriptor_heaps;
     std::array<vk::DescriptorSet, NumRasterizerSets> bound_descriptor_sets{};
     std::array<u32, NumDynamicOffsets> offsets{};
-    // What the previous BindPipeline bound (it skips binding them again unchanged).
-    std::array<vk::DescriptorSet, NumRasterizerSets> last_bound_sets{};
-    std::array<u32, NumDynamicOffsets> last_offsets{};
 
     std::array<u64, MAX_SHADER_STAGES> shader_hashes;
     std::array<Shader*, MAX_SHADER_STAGES> current_shaders;
