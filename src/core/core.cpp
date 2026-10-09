@@ -457,7 +457,17 @@ System::ResultStatus System::Load(Frontend::EmuWindow& emu_window, const std::st
     }
 
 #ifdef AZAHAR_MVD_FFMPEG
-    {
+    // Only the Pokémon games it was checked on (frame for frame against the guest decoder).
+    // Other games carry the same library but drive it from their own movie players: Shin Megami
+    // Tensei: Strange Journey Redux went back to its logos at every title screen with it.
+    constexpr std::array<u64, 8> native_mobiclip_titles{
+        0x0004000000055D00, 0x0004000000055E00,  // X, Y
+        0x000400000011C400, 0x000400000011C500,  // Omega Ruby, Alpha Sapphire
+        0x0004000000164800, 0x0004000000175E00,  // Sun, Moon
+        0x00040000001B5000, 0x00040000001B5100,  // Ultra Sun, Ultra Moon
+    };
+    if (std::find(native_mobiclip_titles.begin(), native_mobiclip_titles.end(), title_id) !=
+        native_mobiclip_titles.end()) {
         // Find the MobiClip video library's three frame decoders (see NativeMobiclipDecode in
         // svc.cpp) and replace each entry instruction with its native-decode SVC. The functions
         // are identical apart from the output stride, which the instruction at +0x114 adds.
