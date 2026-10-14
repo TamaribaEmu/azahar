@@ -190,6 +190,8 @@ private:
     std::mutex send_mutex;
 
     std::atomic<bool> stopped = false;
+    // Tamariba: the server closed a connection (a read got end-of-stream).
+    std::atomic<bool> peer_closed = false;
 
     std::atomic<std::chrono::time_point<std::chrono::steady_clock>> last_sent_request;
     std::thread ping_thread;

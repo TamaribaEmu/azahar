@@ -602,6 +602,13 @@ bool Client::Read(SocketHolder sockFD, void* buffer, size_t size,
     while (read_bytes != size) {
         int new_read =
             ::recv(sockFD, (char*)((uintptr_t)buffer + read_bytes), (int)(size - read_bytes), 0);
+        if (new_read == 0) {
+            // Tamariba: the server closed the connection. Without this the loop read
+            // nothing forever, and everything waiting on this client hung with it.
+            peer_closed = true;
+            read_bytes = 0;
+            break;
+        }
         if (new_read < 0) {
             if (GET_ERRNO == ERRNO(EWOULDBLOCK) &&
                 (timeout == std::chrono::nanoseconds(0) ||
@@ -753,6 +760,10 @@ void Client::Handler::RunLoop() {
     u32 retry_count = 0;
     while (should_run) {
         if (!client.Read(handler_socket, &dataPacket, sizeof(dataPacket))) {
+            if (should_run && client.peer_closed) {
+                signal_error();  // closed for good: no point in waiting 30 s to retry
+                break;
+            }
             if (should_run) {
                 LOG_WARNING(Network, "Failed to read from socket");
                 std::this_thread::sleep_for(100ms);
