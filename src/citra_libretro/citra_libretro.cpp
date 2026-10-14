@@ -226,6 +226,10 @@ static void UpdateSettings() {
     Core::System::GetInstance().ApplySettings();
 }
 
+// Tamariba: set once an Artic Base connection (a game played from a real 3DS) is lost.
+// It can't come back, and RunLoop would fail on every call from then on.
+static bool artic_lost = false;
+
 /**
  * libretro callback; Called every game tick.
  */
@@ -233,7 +237,7 @@ void retro_run() {
     const bool profiling_enabled = Core::IsPerformanceProfilingEnabled();
     const auto retro_run_started = profiling_enabled ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point{};
-    if (!emu_instance->game_loaded) {
+    if (!emu_instance->game_loaded || artic_lost) {
         // Game failed to load (e.g. encrypted ROM, bad path).
         // Present an empty frame so RetroArch doesn't hang.
         LibRetro::PollInput();
@@ -320,6 +324,14 @@ void retro_run() {
             }
 
             LibRetro::DisplayMessage(msg.c_str());
+
+            // Tamariba: without this the loop retries forever and retro_run never returns.
+            if (result == Core::System::ResultStatus::ErrorArticDisconnected) {
+                artic_lost = true;
+                LibRetro::Shutdown();
+                LibRetro::UploadVideoFrame(nullptr, 0, 0, 0);
+                return;
+            }
         }
     }
     if (profiling_enabled) {
@@ -746,6 +758,7 @@ void retro_reset() {
  * libretro callback; Called when a game is to be loaded.
  */
 bool retro_load_game(const struct retro_game_info* info) {
+    artic_lost = false;
     LOG_INFO(Frontend, "Starting Azahar RetroArch game...");
 
 #if CITRA_ARCH(x86_64) && CITRA_HAS_SSE42
