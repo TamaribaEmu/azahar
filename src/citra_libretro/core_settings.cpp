@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cstdio>
 #include <boost/hana/string.hpp>
 
 #include "citra_libretro/core_settings.h"
@@ -853,6 +854,18 @@ static void ParseSystemOptions(void) {
 
     LibRetro::settings.language_value =
         GetLanguageValue(LibRetro::FetchVariable(config::system::language_value, "English"));
+
+    // Tamariba: the profile's name and birthday ("<month>/<day>"); not player-facing options.
+    LibRetro::settings.profile_name = LibRetro::FetchVariable("citra_profile_name", "");
+    LibRetro::settings.profile_birth_month = 0;
+    LibRetro::settings.profile_birth_day = 0;
+    unsigned month = 0, day = 0;
+    if (std::sscanf(LibRetro::FetchVariable("citra_profile_birthday", "").c_str(), "%u/%u", &month,
+                    &day) == 2 &&
+        month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+        LibRetro::settings.profile_birth_month = static_cast<u8>(month);
+        LibRetro::settings.profile_birth_day = static_cast<u8>(day);
+    }
 
     Settings::values.enable_required_online_lle_modules =
         LibRetro::FetchVariable(config::system::online_lle_modules, config::disabled) ==

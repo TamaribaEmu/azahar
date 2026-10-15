@@ -1060,6 +1060,22 @@ Module::Module(Core::System& system_) : system(system_) {
         SetEULAVersion(default_version);
         UpdateConfigNANDSavegame();
     }
+#ifdef HAVE_LIBRETRO
+    // Tamariba: the player's own name and birthday, for this run only (the config savegame in
+    // memory; the NAND's file keeps its own).
+    if (!LibRetro::settings.profile_name.empty()) {
+        std::u16string name = Common::UTF8ToUTF16(LibRetro::settings.profile_name);
+        if (name.size() > 10) {
+            name.resize(10);
+            if (name.back() >= 0xD800 && name.back() <= 0xDBFF)
+                name.pop_back(); // half a character
+        }
+        SetUsername(name);
+    }
+    if (LibRetro::settings.profile_birth_month != 0) {
+        SetBirthday(LibRetro::settings.profile_birth_month, LibRetro::settings.profile_birth_day);
+    }
+#endif
 }
 
 Module::~Module() = default;

@@ -23,6 +23,12 @@ struct CoreSettings {
 
     Service::CFG::SystemLanguage language_value;
 
+    // Tamariba: the 3DS's profile, the Tamariba profile's own (cfg.cpp sets it as the system
+    // starts). An empty name, or a zero month, leaves the console's own.
+    std::string profile_name;
+    u8 profile_birth_month = 0;
+    u8 profile_birth_day = 0;
+
     bool enable_touch_touchscreen;
 
     bool enable_touch_pointer_timeout;
